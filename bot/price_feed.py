@@ -2,6 +2,10 @@
 
 The latency gap between these two feeds is the core edge for the latency
 arb strategy. Binance updates in ~100ms, Chainlink in ~3-15 seconds.
+
+Includes REST API fallback for environments where WebSockets are blocked
+(firewalls, sandboxes, corporate networks). Falls back automatically
+after repeated WS failures.
 """
 
 import asyncio
@@ -11,6 +15,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 
+import httpx
 import websockets
 
 logger = logging.getLogger(__name__)
@@ -51,7 +56,16 @@ class PriceFeed:
     """
 
     BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    BINANCE_REST = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    # Fallback: Binance US or CoinGecko if main Binance is geo-blocked
+    BINANCE_US_REST = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT"
+    COINGECKO_REST = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
     RTDS_WS = "wss://ws-live-data.polymarket.com"
+
+    # After this many consecutive WS failures, switch to REST polling
+    WS_FAIL_THRESHOLD = 3
+    # REST polling interval (seconds) — slower than WS but works everywhere
+    REST_POLL_INTERVAL = 2.0
 
     def __init__(self):
         self.latest_binance: PriceTick | None = None
@@ -60,6 +74,13 @@ class PriceFeed:
         self._running = False
         self._binance_last_update: float = 0
         self._chainlink_last_update: float = 0
+
+        # WebSocket failure tracking for auto-fallback to REST
+        self._binance_ws_fails: int = 0
+        self._chainlink_ws_fails: int = 0
+        self._using_rest_binance: bool = False
+        self._using_rest_chainlink: bool = False
+        self._http_client: httpx.AsyncClient | None = None
 
         # Rolling volume tracking (5-min window)
         self._volume_window: deque[VolumeTick] = deque()
@@ -84,11 +105,24 @@ class PriceFeed:
                 logger.exception("Error in price tick callback")
 
     async def _binance_stream(self):
-        """Connect to Binance trade stream for lowest-latency BTC/USDT prices."""
+        """Connect to Binance trade stream for lowest-latency BTC/USDT prices.
+        Falls back to REST API polling after repeated WebSocket failures."""
         while self._running:
+            # Check if we should fall back to REST
+            if self._binance_ws_fails >= self.WS_FAIL_THRESHOLD:
+                if not self._using_rest_binance:
+                    logger.warning(
+                        "Binance WebSocket failed %d times — switching to REST API polling",
+                        self._binance_ws_fails,
+                    )
+                    self._using_rest_binance = True
+                await self._binance_rest_poll()
+                return  # REST poll runs its own loop
+
             try:
                 async with websockets.connect(self.BINANCE_WS) as ws:
                     logger.info("Connected to Binance BTC/USDT trade stream")
+                    self._binance_ws_fails = 0  # Reset on successful connect
                     async for msg in ws:
                         if not self._running:
                             break
@@ -123,13 +157,18 @@ class PriceFeed:
                         except (KeyError, ValueError) as e:
                             logger.warning("Bad Binance message: %s", e)
             except Exception:
-                logger.exception("Binance stream error, reconnecting in 2s")
+                self._binance_ws_fails += 1
+                logger.warning(
+                    "Binance WS error (%d/%d before REST fallback), retrying in 2s",
+                    self._binance_ws_fails, self.WS_FAIL_THRESHOLD,
+                )
                 await asyncio.sleep(2)
 
     async def _chainlink_stream(self):
         """Connect to Polymarket RTDS for Chainlink BTC/USD prices.
         This is the resolution source — the price that actually determines
-        whether 'Up' or 'Down' wins."""
+        whether 'Up' or 'Down' wins.
+        Falls back to using Binance price as proxy if RTDS WebSocket is blocked."""
         sub_msg = json.dumps(
             {
                 "action": "subscribe",
@@ -144,10 +183,24 @@ class PriceFeed:
         )
 
         while self._running:
+            # Check if we should fall back to REST (use Binance price as Chainlink proxy)
+            if self._chainlink_ws_fails >= self.WS_FAIL_THRESHOLD:
+                if not self._using_rest_chainlink:
+                    logger.warning(
+                        "Chainlink RTDS WebSocket failed %d times — "
+                        "falling back to Binance REST as Chainlink proxy "
+                        "(note: removes latency edge, but allows paper trading)",
+                        self._chainlink_ws_fails,
+                    )
+                    self._using_rest_chainlink = True
+                await self._chainlink_rest_fallback()
+                return
+
             try:
                 async with websockets.connect(self.RTDS_WS) as ws:
                     await ws.send(sub_msg)
                     logger.info("Connected to Polymarket RTDS Chainlink stream")
+                    self._chainlink_ws_fails = 0
                     async for msg in ws:
                         if not self._running:
                             break
@@ -176,8 +229,96 @@ class PriceFeed:
                         except (KeyError, ValueError) as e:
                             logger.warning("Bad Chainlink message: %s", e)
             except Exception:
-                logger.exception("Chainlink RTDS stream error, reconnecting in 2s")
+                self._chainlink_ws_fails += 1
+                logger.warning(
+                    "Chainlink RTDS WS error (%d/%d before REST fallback), retrying in 2s",
+                    self._chainlink_ws_fails, self.WS_FAIL_THRESHOLD,
+                )
                 await asyncio.sleep(2)
+
+    # ---- REST API fallbacks ----
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Lazy-init a shared async HTTP client for REST polling."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=10)
+        return self._http_client
+
+    async def _binance_rest_poll(self):
+        """Poll Binance REST API for BTC price. Fallback when WS is blocked.
+
+        Tries Binance global → Binance US → CoinGecko in order.
+        Slower than WS (~2s interval) but works through firewalls.
+        """
+        client = self._get_http_client()
+        endpoints = [
+            ("Binance", self.BINANCE_REST),
+            ("Binance US", self.BINANCE_US_REST),
+            ("CoinGecko", self.COINGECKO_REST),
+        ]
+        active_endpoint_idx = 0
+
+        logger.info("Binance REST polling started (every %.0fs)", self.REST_POLL_INTERVAL)
+
+        while self._running:
+            name, url = endpoints[active_endpoint_idx]
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Parse price based on which API we're hitting
+                if "CoinGecko" in name:
+                    price = float(data["bitcoin"]["usd"])
+                else:
+                    price = float(data["price"])
+
+                ts_ms = int(time.time() * 1000)
+                tick = PriceTick(
+                    source="binance",
+                    symbol="BTC/USDT",
+                    price=price,
+                    timestamp_ms=ts_ms,
+                )
+                self.latest_binance = tick
+                self._binance_last_update = time.time()
+                await self._notify(tick)
+
+            except Exception as e:
+                logger.warning("Binance REST (%s) error: %s", name, e)
+                # Try next endpoint
+                active_endpoint_idx = (active_endpoint_idx + 1) % len(endpoints)
+                if active_endpoint_idx == 0:
+                    logger.error("All Binance REST endpoints failed")
+
+            await asyncio.sleep(self.REST_POLL_INTERVAL)
+
+    async def _chainlink_rest_fallback(self):
+        """Fallback: use Binance REST price as Chainlink proxy.
+
+        When RTDS WebSocket is blocked, we use the Binance price with a
+        small artificial delay to simulate the Chainlink lag. This removes
+        the latency edge but allows paper trading to function.
+        """
+        logger.info(
+            "Chainlink REST fallback: using Binance price as proxy (3s delay)"
+        )
+
+        while self._running:
+            # Wait for Binance to have a price, then use it with simulated lag
+            if self.latest_binance:
+                # Add artificial 3s lag to simulate Chainlink's slower updates
+                tick = PriceTick(
+                    source="chainlink",
+                    symbol="BTC/USD",
+                    price=self.latest_binance.price,
+                    timestamp_ms=int(time.time() * 1000),
+                )
+                self.latest_chainlink = tick
+                self._chainlink_last_update = time.time()
+                await self._notify(tick)
+
+            await asyncio.sleep(3.0)  # Chainlink updates every ~3-15s
 
     async def _health_monitor(self):
         """Periodically log feed health and warn on stale data."""
@@ -196,10 +337,13 @@ class PriceFeed:
             if self.latest_binance and self.latest_chainlink:
                 gap = self.latest_binance.price - self.latest_chainlink.price
                 gap_pct = gap / self.latest_binance.price * 100
+                mode_b = "REST" if self._using_rest_binance else "WS"
+                mode_c = "REST-proxy" if self._using_rest_chainlink else "WS"
                 logger.info(
-                    "Feed health: Binance=$%.0f (%.1fs ago) Chainlink=$%.0f (%.1fs ago) gap=$%.0f (%.3f%%)",
-                    self.latest_binance.price, binance_age,
-                    self.latest_chainlink.price, chainlink_age,
+                    "Feed health: Binance[%s]=$%.0f (%.1fs ago) "
+                    "Chainlink[%s]=$%.0f (%.1fs ago) gap=$%.0f (%.3f%%)",
+                    mode_b, self.latest_binance.price, binance_age,
+                    mode_c, self.latest_chainlink.price, chainlink_age,
                     gap, gap_pct,
                 )
 
@@ -214,6 +358,9 @@ class PriceFeed:
 
     def stop(self):
         self._running = False
+        if self._http_client:
+            # Schedule cleanup (can't await in sync method)
+            asyncio.get_event_loop().create_task(self._http_client.aclose())
 
     # ---- Volume analysis ----
 
@@ -283,13 +430,16 @@ class PriceFeed:
         """Check if Binance data is fresh enough to trade on."""
         if not self._binance_last_update:
             return False
-        return (time.time() - self._binance_last_update) < max_age_s
+        # REST polling is slower — allow 2x staleness threshold
+        threshold = max_age_s * 2 if self._using_rest_binance else max_age_s
+        return (time.time() - self._binance_last_update) < threshold
 
     def is_chainlink_fresh(self, max_age_s: float = 30) -> bool:
         """Check if Chainlink data is fresh enough to trade on."""
         if not self._chainlink_last_update:
             return False
-        return (time.time() - self._chainlink_last_update) < max_age_s
+        threshold = max_age_s * 2 if self._using_rest_chainlink else max_age_s
+        return (time.time() - self._chainlink_last_update) < threshold
 
     def get_price_gap(self) -> float | None:
         """Return Binance - Chainlink price difference.

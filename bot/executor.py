@@ -80,9 +80,9 @@ class Executor:
             self._paper_realized_pnl = 0.0
             self._paper_market_prices: dict[str, float] = {}  # token_id → price
             logger.info(
-                "PAPER TRADING mode — starting balance: $%,.0f | "
+                "PAPER TRADING mode — starting balance: $%s | "
                 "fills simulated from real market prices",
-                self._paper_balance,
+                f"{self._paper_balance:,.0f}",
             )
 
         self.tracked_orders: dict[str, TrackedOrder] = {}
@@ -400,14 +400,14 @@ class Executor:
             fill_latency = now - order.placed_at
             logger.info(
                 "PAPER order FILLED: %s | %s %.1f shares @ $%.2f | "
-                "market=$%.2f | latency=%.1fs | balance=$%,.0f",
+                "market=$%.2f | latency=%.1fs | balance=$%s",
                 order.order_id,
                 "SELL" if order.is_sell else "BUY",
                 order.filled_shares,
                 order.price,
                 market_price,
                 fill_latency,
-                self._paper_balance,
+                f"{self._paper_balance:,.0f}",
             )
 
             self._log_trade("fill", {
@@ -526,12 +526,12 @@ class Executor:
 
         logger.info(
             "PAPER SETTLED: %s | %s | P&L=$%+.2f | "
-            "balance=$%,.0f | total P&L=$%+.0f",
+            "balance=$%s | total P&L=$%s",
             order.order_id,
             "WIN" if won else "LOSS",
             pnl,
-            self._paper_balance,
-            self._paper_realized_pnl,
+            f"{self._paper_balance:,.0f}",
+            f"{self._paper_realized_pnl:+,.0f}",
         )
 
         self._log_trade("settle", {
@@ -598,11 +598,11 @@ class Executor:
         if self.dry_run:
             available = self._paper_balance - self._paper_collateral_locked
             logger.info(
-                "PAPER balance: $%,.0f (locked: $%,.0f, available: $%,.0f, P&L: $%+,.0f)",
-                self._paper_balance,
-                self._paper_collateral_locked,
-                available,
-                self._paper_realized_pnl,
+                "PAPER balance: $%s (locked: $%s, available: $%s, P&L: $%s)",
+                f"{self._paper_balance:,.0f}",
+                f"{self._paper_collateral_locked:,.0f}",
+                f"{available:,.0f}",
+                f"{self._paper_realized_pnl:+,.0f}",
             )
             return available
 
