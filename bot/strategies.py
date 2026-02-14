@@ -74,10 +74,16 @@ class LatencyArbStrategy:
     # Timing window — trades in the second half of intervals
     # 15-min intervals: trade at 600-780s (10-13 min mark)
     # 5-min intervals: trade at 180-260s (3-4.3 min mark)
+    # Hourly intervals: trade at 2400-3300s (40-55 min mark)
+    # Daily intervals: no timing gate (always active after first 30 min)
     ENTRY_WINDOW_15M_START = 600   # 10 min into 15-min interval
     ENTRY_WINDOW_15M_END = 780     # 13 min into 15-min interval
     ENTRY_WINDOW_5M_START = 180    # 3 min into 5-min interval
     ENTRY_WINDOW_5M_END = 260      # 4.3 min into 5-min interval
+    ENTRY_WINDOW_1H_START = 2400   # 40 min into hourly interval
+    ENTRY_WINDOW_1H_END = 3300     # 55 min into hourly interval
+    ENTRY_WINDOW_DAILY_START = 1800  # 30 min in (allow warmup)
+    ENTRY_WINDOW_DAILY_END = 82800   # 23 hours (stop 1h before close)
 
     # Guy 1's exact price: 97.6% of fills at $0.51
     SELL_PRICE = 0.51
@@ -157,13 +163,19 @@ class LatencyArbStrategy:
                           f"Exposure ${current_exposure_usd:.0f} >= max ${self.MAX_ACTIVE_EXPOSURE}")
 
         # TIMING GATE: Select window based on interval duration
-        is_5min = interval_duration < 900
-        if not is_5min:  # 15-min interval
-            window_start = self.ENTRY_WINDOW_15M_START
-            window_end = self.ENTRY_WINDOW_15M_END
-        else:  # 5-min interval
+        is_5min = interval_duration <= 300
+        if interval_duration >= 86400:  # daily
+            window_start = self.ENTRY_WINDOW_DAILY_START
+            window_end = self.ENTRY_WINDOW_DAILY_END
+        elif interval_duration >= 3600:  # hourly
+            window_start = self.ENTRY_WINDOW_1H_START
+            window_end = self.ENTRY_WINDOW_1H_END
+        elif is_5min:
             window_start = self.ENTRY_WINDOW_5M_START
             window_end = self.ENTRY_WINDOW_5M_END
+        else:  # 15-min
+            window_start = self.ENTRY_WINDOW_15M_START
+            window_end = self.ENTRY_WINDOW_15M_END
 
         if seconds_into_interval < window_start:
             return Signal(Side.NONE, 0, 0, 0, 0,

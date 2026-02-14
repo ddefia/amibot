@@ -26,6 +26,9 @@ def setup_logging(config: Config):
         format=fmt,
         handlers=handlers,
     )
+    # Quiet down noisy HTTP request logging from httpx
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main():

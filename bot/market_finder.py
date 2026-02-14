@@ -1,154 +1,176 @@
 """Finds active BTC Up/Down markets on Polymarket via the Gamma API.
 
-Supports both 5-min and 15-min interval markets. Prefers 15-min because
-cross-trader data shows 15-min = +$305K net vs 5-min = -$8.4K net.
+These markets don't appear in generic /events or /markets queries.
+They must be fetched by constructing the exact slug for the current
+date/time. Discovered slug patterns:
+
+  Daily:  bitcoin-up-or-down-on-february-14
+  Hourly: bitcoin-up-or-down-february-14-3am-et
+
+Priority order: hourly > daily (more trading opportunities, higher edge).
 """
 
-import re
+import json
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Patterns that appear in BTC Up/Down market questions/slugs
-BTC_PATTERNS = [
-    "bitcoin-up-or-down",
-    "btc-updown",
-    "btc-up-down",
-    "bitcoin up or down",
-]
+# Eastern Time offset (UTC-5, or UTC-4 during DST)
+ET = timezone(timedelta(hours=-5))
 
 
-def _parse_duration_from_question(question: str) -> int | None:
-    """Parse interval duration from a market question string.
+def _month_name(dt: datetime) -> str:
+    """Return lowercase full month name."""
+    return dt.strftime("%B").lower()
 
-    Examples:
-        "Bitcoin Up or Down - February 13, 6:15PM-6:30PM ET" → 900 (15-min)
-        "Bitcoin Up or Down - February 13, 5PM ET" → 3600 (hourly)
-        "Bitcoin Up or Down - February 13, 5:00PM-5:05PM ET" → 300 (5-min)
+
+def _build_hourly_slug(dt_et: datetime) -> str:
+    """Build slug for the hourly market at the given ET hour.
+
+    Example: 'bitcoin-up-or-down-february-14-3am-et'
     """
-    # Try time range: "6:15PM-6:30PM" or "6:15 PM - 6:30 PM"
-    m = re.search(
-        r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)',
-        question, re.IGNORECASE,
-    )
-    if m:
-        h1, m1, ap1 = int(m.group(1)), int(m.group(2)), m.group(3).upper()
-        h2, m2, ap2 = int(m.group(4)), int(m.group(5)), m.group(6).upper()
-        t1 = ((h1 % 12) + (12 if ap1 == "PM" else 0)) * 60 + m1
-        t2 = ((h2 % 12) + (12 if ap2 == "PM" else 0)) * 60 + m2
-        if t2 > t1:
-            return (t2 - t1) * 60
+    month = _month_name(dt_et)
+    day = dt_et.day
+    h = dt_et.hour
+    ampm = "am" if h < 12 else "pm"
+    h12 = h % 12 if h % 12 != 0 else 12
+    return f"bitcoin-up-or-down-{month}-{day}-{h12}{ampm}-et"
 
-    # Try single time: "5PM ET" or "5 PM ET" (hourly market)
-    if re.search(r'\d{1,2}\s*(AM|PM)\s+ET', question, re.IGNORECASE):
-        if not re.search(r'\d{1,2}:\d{2}', question):
-            return 3600
 
-    return None
+def _build_daily_slug(dt_et: datetime) -> str:
+    """Build slug for the daily market.
+
+    Example: 'bitcoin-up-or-down-on-february-14'
+    """
+    month = _month_name(dt_et)
+    day = dt_et.day
+    return f"bitcoin-up-or-down-on-{month}-{day}"
 
 
 class MarketFinder:
-    """Discovers and tracks active BTC Up/Down markets."""
+    """Discovers and tracks active BTC Up/Down markets via slug construction."""
 
     def __init__(self, gamma_host: str, prefer_15min: bool = True):
         self.gamma_host = gamma_host
         self.prefer_15min = prefer_15min
         self.client = httpx.Client(timeout=15)
-        self._cache: list[dict] = []
+        self._cache: dict | None = None
+        self._cache_slug: str = ""
         self._cache_ts: float = 0
-        self._cache_ttl: float = 10  # seconds
+        self._cache_ttl: float = 30  # seconds
 
-    def get_active_markets(self) -> list[dict]:
-        """Fetch all currently active BTC Up/Down markets.
-
-        Caches results for 10 seconds to avoid spamming the API.
-        """
-        now = time.time()
-        if self._cache and (now - self._cache_ts) < self._cache_ttl:
-            return self._cache
-
+    def _fetch_event_by_slug(self, slug: str) -> dict | None:
+        """Fetch a single event by exact slug. Returns the first market or None."""
         try:
             resp = self.client.get(
-                f"{self.gamma_host}/markets",
-                params={"active": "true", "closed": "false", "limit": 200},
+                f"{self.gamma_host}/events",
+                params={"slug": slug},
             )
             resp.raise_for_status()
-            all_markets = resp.json()
-        except Exception:
-            logger.exception("Failed to fetch markets from Gamma API")
-            return self._cache  # Return stale cache on error
-
-        # Filter to BTC Up/Down markets
-        btc_markets = []
-        for m in all_markets:
-            slug = m.get("slug", "").lower()
-            question = m.get("question", "").lower()
-            combined = slug + " " + question
-
-            if any(p in combined for p in BTC_PATTERNS):
-                # Parse interval duration from the question
-                q = m.get("question", "")
-                duration = _parse_duration_from_question(q)
-                m["_interval_duration"] = duration or 900  # default 15-min
-                btc_markets.append(m)
-
-        self._cache = btc_markets
-        self._cache_ts = now
-        logger.info("Found %d active BTC Up/Down markets", len(btc_markets))
-        return btc_markets
+            events = resp.json()
+            if events and events[0].get("markets"):
+                return events[0]["markets"][0]
+        except Exception as e:
+            logger.debug("Slug %s not found: %s", slug, e)
+        return None
 
     def get_best_market(self) -> dict | None:
-        """Get the best active market to trade right now.
+        """Get the best active BTC Up/Down market for right now.
 
-        Prefers 15-min intervals (cross-trader data: +$305K net).
-        Falls back to 5-min only if no 15-min available.
-        Returns the market with the most time remaining for entry.
+        Tries hourly first (current hour, then next hour for early entry),
+        then falls back to the daily market.
         """
-        markets = self.get_active_markets()
-        if not markets:
-            return None
+        now_utc = datetime.now(timezone.utc)
+        now_et = now_utc.astimezone(ET)
 
-        now = int(time.time())
+        # Check cache
+        hourly_slug = _build_hourly_slug(now_et)
+        if (self._cache
+                and self._cache_slug == hourly_slug
+                and (time.time() - self._cache_ts) < self._cache_ttl):
+            return self._cache
 
-        # Separate by interval duration
-        markets_15m = [m for m in markets if m.get("_interval_duration", 900) == 900]
-        markets_5m = [m for m in markets if m.get("_interval_duration", 900) == 300]
-        markets_other = [m for m in markets
-                         if m.get("_interval_duration", 900) not in (300, 900)]
+        # Try current hourly market
+        market = self._fetch_event_by_slug(hourly_slug)
+        if market:
+            active = market.get("active", False)
+            closed = market.get("closed", True)
+            if active and not closed:
+                market["_interval_duration"] = 3600
+                self._cache = market
+                self._cache_slug = hourly_slug
+                self._cache_ts = time.time()
+                logger.info("Found hourly market: %s", market.get("question", ""))
+                return market
 
-        # Prefer 15-min, then other, then 5-min
-        if self.prefer_15min:
-            candidates = markets_15m or markets_other or markets_5m
-        else:
-            candidates = markets_5m or markets_15m or markets_other
+        # Try daily market
+        daily_slug = _build_daily_slug(now_et)
+        market = self._fetch_event_by_slug(daily_slug)
+        if market:
+            active = market.get("active", False)
+            closed = market.get("closed", True)
+            if active and not closed:
+                # Daily markets: noon-to-noon ET = 86400s
+                market["_interval_duration"] = 86400
+                self._cache = market
+                self._cache_slug = daily_slug
+                self._cache_ts = time.time()
+                logger.info("Found daily market: %s", market.get("question", ""))
+                return market
 
-        if not candidates:
-            return None
+        # Try tomorrow's daily (in case today's has closed)
+        tomorrow_et = now_et + timedelta(days=1)
+        tomorrow_slug = _build_daily_slug(tomorrow_et)
+        market = self._fetch_event_by_slug(tomorrow_slug)
+        if market:
+            active = market.get("active", False)
+            closed = market.get("closed", True)
+            if active and not closed:
+                market["_interval_duration"] = 86400
+                self._cache = market
+                self._cache_slug = tomorrow_slug
+                self._cache_ts = time.time()
+                logger.info("Found tomorrow daily market: %s", market.get("question", ""))
+                return market
 
-        # If multiple candidates, return the first active one
-        # (Gamma API returns them in chronological order)
-        return candidates[0]
+        logger.warning("No active BTC Up/Down market found for %s", now_et.strftime("%b %d %I%p ET"))
+        return None
 
     def get_current_market(self) -> dict | None:
         """Alias for get_best_market() — backward compatible."""
         return self.get_best_market()
 
+    def get_active_markets(self) -> list[dict]:
+        """Backward compat: return best market as a list."""
+        m = self.get_best_market()
+        return [m] if m else []
+
     def parse_market(self, market: dict) -> dict:
         """Extract trading-relevant fields from a market response.
 
         Handles both "Up"/"Down" and "Yes"/"No" outcome labels.
+        Note: Gamma API returns these fields as JSON strings, not lists.
         """
         tokens = market.get("clobTokenIds", [])
         prices = market.get("outcomePrices", [])
         outcomes = market.get("outcomes", [])
 
+        # Gamma API returns JSON-encoded strings — parse them
+        if isinstance(tokens, str):
+            tokens = json.loads(tokens)
+        if isinstance(prices, str):
+            prices = json.loads(prices)
+        if isinstance(outcomes, str):
+            outcomes = json.loads(outcomes)
+
         parsed = {
             "condition_id": market.get("conditionId"),
             "slug": market.get("slug", ""),
             "question": market.get("question", ""),
-            "interval_duration": market.get("_interval_duration", 900),
+            "interval_duration": market.get("_interval_duration", 3600),
             "tokens": {},
         }
 

@@ -63,7 +63,7 @@ class BotEngine:
         self.current_parsed: dict | None = None
         self.interval_start_price: float | None = None
         self.interval_start_ts: int = 0
-        self.interval_duration: int = 900  # Detected from market
+        self.interval_duration: int = 3600  # Detected from market
         self.positions_this_interval: int = 0
         self.total_active_usd: float = 0
 
@@ -72,6 +72,7 @@ class BotEngine:
         self._tick_count = 0
         self._last_fill_check: float = 0
         self._last_signal_ts: float = 0  # Rate limit signals
+        self._last_market_refresh: float = 0  # Refresh market prices
 
     async def run(self):
         """Main entry point — start the bot."""
@@ -128,8 +129,7 @@ class BotEngine:
         self._tick_count += 1
 
         # Detect interval boundaries using actual market data
-        # Use the interval duration from the current market, or 900 (15-min) default
-        interval_mod = self.interval_duration if self.interval_duration > 0 else 900
+        interval_mod = self.interval_duration if self.interval_duration > 0 else 3600
         current_interval = now - (now % interval_mod)
         seconds_into_interval = now % interval_mod
 
@@ -162,18 +162,20 @@ class BotEngine:
             self.current_market = self.market_finder.get_best_market()
             if self.current_market:
                 self.current_parsed = self.market_finder.parse_market(self.current_market)
-                self.interval_duration = self.current_parsed.get("interval_duration", 900)
+                self.interval_duration = self.current_parsed.get("interval_duration", 3600)
                 interval_min = self.interval_duration // 60
                 logger.info("Market: %s (%d-min)", self.current_parsed["slug"], interval_min)
-
-                if interval_min <= 5:
-                    logger.warning(
-                        "5-min interval — higher thresholds active "
-                        "(cross-trader: 5-min=-$8.4K, 15-min=+$305K)"
-                    )
             else:
                 logger.warning("No active BTC market found — waiting")
                 return
+
+        # ---- REFRESH MARKET PRICES (every 15s for hourly/daily markets) ----
+        if self.current_market and (time.time() - self._last_market_refresh) > 15:
+            refreshed = self.market_finder.get_best_market()
+            if refreshed:
+                self.current_parsed = self.market_finder.parse_market(refreshed)
+                self.current_market = refreshed
+            self._last_market_refresh = time.time()
 
         # ---- PERIODIC BALANCE REFRESH ----
         if self.risk.needs_balance_refresh():
