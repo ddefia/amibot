@@ -237,17 +237,82 @@ For additional edge when Guy 1's strategy has no opportunities:
 
 ---
 
+## CROSS-TRADER BTC LESSONS (3,029 positions analyzed)
+
+These lessons are extracted from analyzing ALL 5 traders' BTC-specific trades and are now incorporated into the bot.
+
+### Lesson 1: 15-min intervals crush 5-min
+| Interval | Positions | Win Rate | Total PnL | Verdict |
+|----------|-----------|----------|-----------|---------|
+| 5-min | 497 | 48.3% | **-$8,361** | NET LOSER |
+| 15-min | 2,387 | 50.7% | **+$305,092** | STRONG WINNER |
+
+**Bot change**: 5-min intervals require 50% higher edge threshold and 8% higher confidence minimum.
+
+### Lesson 2: Entry price zones
+| Range | Win Rate | Avg PnL% | Verdict |
+|-------|---------|---------|---------|
+| 0.20-0.30 | 25.8% | -41.9% | DEATH ZONE |
+| 0.30-0.40 | 24.5% | -46.0% | WORST ZONE (-$196K aggregate) |
+| 0.40-0.50 | 37.7% | -19.2% | STILL LOSING |
+| **0.50-0.60** | **55.4%** | **+5.1%** | **GUY 1's ZONE** |
+| **0.60-0.70** | **70.4%** | **+14.5%** | **BEST RISK-ADJUSTED** |
+
+**Bot change**: Removed single-side cheap buys from mispricing strategy. Only pure arb (combined < $1.00) is allowed on the buy side.
+
+### Lesson 3: Conviction-based sizing works
+- Winners averaged $3,239 invested vs losers at $2,136
+- $5K-$10K bucket: 68.6% WR
+- <$500 bucket: 36-40% WR
+- Correlation: r=0.14 (mild but consistent)
+
+**Bot change**: Position size now scales from 60% to 130% of base based on confidence level. Higher confidence = bigger position.
+
+### Lesson 4: Feed disagreement kills edge
+- Guy 5 lost $19K on No/Down bets without feed confirmation
+- When Binance and Chainlink disagree, conviction should be very low
+
+**Bot change**: Feed disagreement penalty increased from 15% to 25% confidence cut.
+
+### Lesson 5: No/Down is not universally better
+- Yes/Up: 51.2% WR overall, $191K total PnL
+- No/Down: 49.0% WR, $131K total PnL
+- BUT No/Down winners pay bigger (83.8% avg return vs lower for Yes/Up)
+- Guy 5 specifically loses -$19K on Down — it's riskier without conviction
+
+**Bot change**: No direction bias — follow the Binance signal regardless. The data doesn't support a fixed directional preference.
+
+### Lesson 6: Losses are almost always -100%
+- Top 15 worst trades ALL lost 100% of invested capital
+- Binary markets = total loss when wrong, no partial recovery
+- This makes position sizing and conviction filtering critical
+
+**Bot change**: Multiple gates (timing, price, edge, confidence, feed agreement) all must pass before any position is opened.
+
+### What each trader teaches us:
+| Trader | BTC PnL | Key Lesson |
+|--------|---------|------------|
+| **Guy 1** | +$132K | SELL at 0.51, 15-min only, small positions, automated |
+| **Guy 3** | +$84K (BTC) | No/Down can be more profitable per trade, but requires huge capital |
+| **Guy 4** | +$90K | 50% WR can still profit if sizing is right, avoid 5-min |
+| **Guy 5** | +$11K | 0.40-0.50 entries without edge = break-even at best, Down bets without confirmation = disaster |
+| **Guy 2** | +$5K (BTC) | Lottery tickets (<$0.30) rarely pay off, diversification destroys crypto edge |
+
+---
+
 ## FINAL BOT CONFIGURATION
 
 Based on all 5 traders' data, the optimal bot should:
 
-1. **Trade ONLY BTC Up/Down markets** (15-min intervals preferred)
+1. **Trade ONLY BTC Up/Down markets** (15-min intervals strongly preferred)
 2. **Place SELL maker orders at 0.51** when directional edge detected
-3. **Position size: $1,500** per market (scale to $2,000 after profitability proven)
+3. **Position size: $900-$1,950** per market (confidence-scaled from $1,500 base)
 4. **Max 3-5 concurrent positions** (keep active bets under $10k)
 5. **Use Binance WebSocket** for price signal, **Chainlink** for confirmation
-6. **Minimum edge: 3%** (don't trade when market is balanced)
+6. **Minimum edge: 3%** on 15-min, **4.5%** on 5-min (penalized)
 7. **Auto-fill speed: <1 second** (need sub-second order placement)
 8. **Daily loss limit: $5,000** (Guy 1's worst single day was ~$27k loss)
 9. **No sports/politics/diversification** — this destroys edge
 10. **Cycle positions rapidly** — don't baghold, let markets resolve
+11. **No cheap single-side buys** — 0.20-0.50 range is a death zone
+12. **25% confidence penalty** when Binance and Chainlink disagree

@@ -3,7 +3,14 @@ risk management, and order execution into a single async loop.
 
 Updated based on deep trade-by-trade analysis of 5 Polymarket traders.
 Now supports SELL-side maker orders (Guy 1's exact strategy) and
-15-min interval detection in addition to 5-min."""
+15-min interval detection in addition to 5-min.
+
+Cross-trader lessons applied:
+- Prefer 15-min intervals (net +$305K) over 5-min (net -$8.4K)
+- Conviction-scaled position sizing (bigger on high confidence)
+- Stronger feed disagreement penalty
+- Sell-side exposure calculated correctly
+"""
 
 import asyncio
 import time
@@ -45,6 +52,7 @@ class BotEngine:
         )
         self.mispricing = MispricingStrategy(
             max_position=config.max_position_size,
+            # Pure arb only — no cheap single-side buys (cross-trader lesson)
         )
 
         # State
@@ -144,8 +152,15 @@ class BotEngine:
             if self.current_market:
                 parsed = self.market_finder.parse_market(self.current_market)
                 self.interval_duration = self._detect_interval_duration()
+                interval_min = self.interval_duration // 60
                 logger.info("Active market: %s (%d-min interval)",
-                            parsed["slug"], self.interval_duration // 60)
+                            parsed["slug"], interval_min)
+                # Cross-trader lesson: 5-min intervals are net losers
+                if interval_min <= 5:
+                    logger.warning(
+                        "5-min interval detected — higher edge/confidence required "
+                        "(cross-trader data: 5-min = -$8.4K net, 15-min = +$305K net)"
+                    )
             else:
                 logger.warning("No active market found")
                 return

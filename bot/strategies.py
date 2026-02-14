@@ -11,6 +11,15 @@ of 5 real Polymarket traders (PDF reports, CSV data, screenshots):
    BUY underpriced contracts across BTC/ETH/SOL/XRP simultaneously.
 
 3. Market Making — provide liquidity on both sides, earn spread + rebates
+
+CROSS-TRADER LESSONS (3,029 BTC positions analyzed):
+- 15-min intervals: +$305K total PnL (50.7% WR) — PREFER these
+- 5-min intervals: -$8.4K total PnL (48.3% WR) — AVOID or require higher edge
+- Entry 0.50-0.60: 55.4% WR, best zone for sell-side (Guy 1's zone)
+- Entry 0.20-0.50: death zone, 25-38% WR, massive aggregate losses
+- Larger positions correlate with wins (r=0.14) — scale up on confidence
+- Feed disagreement kills edge — Guy 5 lost $19K on Down bets without confirmation
+- Losses are almost always -100% — binary outcomes, no partial recovery
 """
 
 import time
@@ -82,6 +91,20 @@ class LatencyArbStrategy:
     MAX_POSITION_USD = 5000        # Hard cap per single market
     MAX_ACTIVE_EXPOSURE = 10000    # Total across all active positions
 
+    # Cross-trader lesson: 5-min intervals are net losers (-$8.4K across 497 positions)
+    # Require higher edge/confidence on 5-min to compensate
+    FIVE_MIN_EDGE_MULTIPLIER = 1.5   # 50% higher edge required for 5-min
+    FIVE_MIN_CONFIDENCE_BOOST = 0.08  # Need 8% more confidence for 5-min
+
+    # Cross-trader lesson: feed disagreement kills edge (Guy 5 pattern)
+    # Stronger penalty than before — disagreement means low conviction
+    FEED_DISAGREE_PENALTY = 0.75  # 25% confidence cut (was 15%)
+
+    # Cross-trader lesson: scale position size with confidence (r=0.14 correlation)
+    # Higher confidence → bigger position (like winners across all traders)
+    MIN_CONFIDENCE_SIZE_SCALE = 0.6   # At minimum confidence, use 60% of position_usd
+    MAX_CONFIDENCE_SIZE_SCALE = 1.3   # At max confidence, use 130% of position_usd
+
     def __init__(
         self,
         min_edge: float = 0.03,
@@ -122,7 +145,8 @@ class LatencyArbStrategy:
                           f"Exposure ${current_exposure_usd:.0f} >= max ${self.MAX_ACTIVE_EXPOSURE}")
 
         # TIMING GATE: Select window based on interval duration
-        if interval_duration >= 900:  # 15-min interval
+        is_5min = interval_duration < 900
+        if not is_5min:  # 15-min interval
             window_start = self.ENTRY_WINDOW_15M_START
             window_end = self.ENTRY_WINDOW_15M_END
         else:  # 5-min interval
@@ -155,10 +179,12 @@ class LatencyArbStrategy:
         raw_confidence = min(0.95, 0.50 + (move_magnitude / 80) * time_factor)
 
         # Dual feed confirmation bonus
+        # Cross-trader lesson: feed disagreement is strongly anti-predictive
+        # Guy 5 lost $19K on No/Down bets without feed confirmation
         if feeds_agree:
             raw_confidence = min(0.97, raw_confidence + 0.05)
         else:
-            raw_confidence *= 0.85
+            raw_confidence *= self.FEED_DISAGREE_PENALTY  # 25% cut (was 15%)
 
         # SELL-SIDE LOGIC (Guy 1's actual approach):
         # Sell the contract on the LOSING side (the one about to go to $0)
@@ -183,20 +209,42 @@ class LatencyArbStrategy:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0,
                           f"Price ${target_price:.2f} too high to sell (max ${self.MAX_SELL_PRICE})")
 
+        # 5-MIN PENALTY: Cross-trader data shows 5-min is net -$8.4K loser
+        # Require higher edge and confidence to trade 5-min intervals
+        effective_min_edge = self.min_edge
+        effective_min_confidence = self.confidence_threshold
+        if is_5min:
+            effective_min_edge *= self.FIVE_MIN_EDGE_MULTIPLIER
+            effective_min_confidence += self.FIVE_MIN_CONFIDENCE_BOOST
+            logger.debug("5-min penalty: edge threshold %.3f, confidence threshold %.3f",
+                         effective_min_edge, effective_min_confidence)
+
         # EDGE GATE
-        if edge < self.min_edge:
+        if edge < effective_min_edge:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0,
-                          f"Edge {edge:.3f} below threshold {self.min_edge}")
+                          f"Edge {edge:.3f} below threshold {effective_min_edge:.3f}"
+                          f"{' (5min penalty)' if is_5min else ''}")
 
         # CONFIDENCE GATE
-        if raw_confidence < self.confidence_threshold:
+        if raw_confidence < effective_min_confidence:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0,
-                          f"Confidence {raw_confidence:.3f} below threshold")
+                          f"Confidence {raw_confidence:.3f} below threshold"
+                          f"{' (5min penalty)' if is_5min else ''}")
 
-        # Position sizing — fixed USD amount like Guy 1
+        # CONVICTION-SCALED SIZING: Cross-trader lesson — bigger positions on higher
+        # confidence correlate with wins (r=0.14). Scale from 60% to 130% of base size.
+        confidence_range = 0.97 - effective_min_confidence
+        if confidence_range > 0:
+            confidence_pct = (raw_confidence - effective_min_confidence) / confidence_range
+        else:
+            confidence_pct = 0.5
+        size_scale = (self.MIN_CONFIDENCE_SIZE_SCALE +
+                      confidence_pct * (self.MAX_CONFIDENCE_SIZE_SCALE - self.MIN_CONFIDENCE_SIZE_SCALE))
+        base_size = self.position_usd * size_scale
+
         # Scale down if remaining exposure budget is small
         remaining_budget = self.MAX_ACTIVE_EXPOSURE - current_exposure_usd
-        size_usd = min(self.position_usd, remaining_budget)
+        size_usd = min(base_size, remaining_budget)
 
         if size_usd < 100:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0, "Size too small")
@@ -226,15 +274,20 @@ class MispricingStrategy:
 
     Inspired by the 'Gabagool' method — don't predict direction, just buy
     whichever side is cheap. In a binary market, if Up + Down < $1.00,
-    buying both guarantees profit."""
+    buying both guarantees profit.
+
+    CROSS-TRADER LESSONS APPLIED:
+    - Pure arb (combined < $1.00) is the ONLY reliable buy-side strategy
+    - Single-side cheap buys in the 0.20-0.50 range are a DEATH ZONE:
+      25-38% WR, massive aggregate losses across 3,029 BTC positions
+    - Only buy cheap contracts (<$0.10) as small lottery tickets if at all
+    - Guy 5 lost $19K buying at 0.40-0.50 without directional edge"""
 
     def __init__(
         self,
-        cheap_threshold: float = 0.35,
         combined_threshold: float = 0.97,
         max_position: float = 100,
     ):
-        self.cheap_threshold = cheap_threshold
         self.combined_threshold = combined_threshold
         self.max_position = max_position
 
@@ -245,7 +298,8 @@ class MispricingStrategy:
     ) -> Signal:
         combined = market_up_price + market_down_price
 
-        # Pure arbitrage: combined price < $1.00
+        # Pure arbitrage: combined price < $1.00 — ONLY reliable buy strategy
+        # This is mathematically guaranteed profit, not directional
         if combined < self.combined_threshold:
             cheaper_side = (
                 Side.BUY_UP if market_up_price <= market_down_price else Side.BUY_DOWN
@@ -261,26 +315,10 @@ class MispricingStrategy:
                 reason=f"Combined price ${combined:.3f} < $1.00, guaranteed edge ${edge:.3f}",
             )
 
-        # Single-side value: one side trading very cheap
-        if market_up_price < self.cheap_threshold:
-            return Signal(
-                side=Side.BUY_UP,
-                confidence=0.6,
-                edge=0.5 - market_up_price,  # rough edge estimate
-                price=market_up_price,
-                size=self.max_position * 0.5,
-                reason=f"Up shares cheap at ${market_up_price:.3f}",
-            )
-
-        if market_down_price < self.cheap_threshold:
-            return Signal(
-                side=Side.BUY_DOWN,
-                confidence=0.6,
-                edge=0.5 - market_down_price,
-                price=market_down_price,
-                size=self.max_position * 0.5,
-                reason=f"Down shares cheap at ${market_down_price:.3f}",
-            )
+        # REMOVED: Single-side cheap buys at 0.20-0.50
+        # Cross-trader data: 0.20-0.50 entry range has 25-38% WR and massive
+        # aggregate losses. Guy 5's biggest failure was buying at 0.40-0.50
+        # without directional edge. Only pure arb (combined < $1.00) is safe.
 
         return Signal(Side.NONE, 0, 0, 0, 0, "No mispricing detected")
 

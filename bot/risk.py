@@ -1,10 +1,17 @@
-"""Risk management: position sizing, loss limits, and cooldowns."""
+"""Risk management: position sizing, loss limits, and cooldowns.
+
+CROSS-TRADER LESSONS APPLIED:
+- Losses are almost always -100% in binary markets (no partial recovery)
+- 5-min intervals are net losers — tighter risk limits on these
+- Feed disagreement + Down bets = Guy 5's $19K loss pattern
+- Sell-side exposure = (1 - sell_price) × shares (what you pay if wrong)
+"""
 
 import time
 import logging
 from dataclasses import dataclass, field
 
-from bot.strategies import Signal
+from bot.strategies import Signal, Side
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +24,7 @@ class TradeRecord:
     size: float
     pnl: float  # realized P&L (0 until resolved)
     resolved: bool = False
+    is_sell: bool = False
 
 
 class RiskManager:
@@ -62,11 +70,19 @@ class RiskManager:
             )
 
         # Max exposure check
-        trade_cost = signal.price * signal.size
-        if self.total_exposure + trade_cost > self.config.max_exposure_usdc:
+        # For SELL orders: risk = (1 - sell_price) × shares if the contract resolves to $1
+        # For BUY orders: risk = price × size (standard)
+        is_sell = signal.side in (Side.SELL_UP, Side.SELL_DOWN)
+        if is_sell:
+            shares = signal.size / signal.price if signal.price > 0 else 0
+            trade_risk = (1.0 - signal.price) * shares
+        else:
+            trade_risk = signal.price * signal.size
+
+        if self.total_exposure + trade_risk > self.config.max_exposure_usdc:
             return False, (
                 f"Would exceed max exposure "
-                f"(${self.total_exposure:.2f} + ${trade_cost:.2f} "
+                f"(${self.total_exposure:.2f} + ${trade_risk:.2f} "
                 f"> ${self.config.max_exposure_usdc:.2f})"
             )
 
@@ -95,15 +111,24 @@ class RiskManager:
 
     def record_trade(self, signal: Signal):
         """Record a trade entry."""
+        is_sell = signal.side in (Side.SELL_UP, Side.SELL_DOWN)
         trade = TradeRecord(
             timestamp=time.time(),
             side=signal.side.value,
             price=signal.price,
             size=signal.size,
             pnl=0.0,
+            is_sell=is_sell,
         )
         self.trades.append(trade)
-        self.total_exposure += signal.price * signal.size
+
+        # Sell-side exposure: risk is (1-price)×shares if contract resolves to $1
+        # Buy-side exposure: risk is price×size (what you paid)
+        if is_sell:
+            shares = signal.size / signal.price if signal.price > 0 else 0
+            self.total_exposure += (1.0 - signal.price) * shares
+        else:
+            self.total_exposure += signal.price * signal.size
 
     def record_resolution(self, trade_index: int, won: bool):
         """Record the outcome of a resolved trade."""
@@ -115,15 +140,31 @@ class RiskManager:
             return
 
         trade.resolved = True
-        cost = trade.price * trade.size
-        self.total_exposure -= cost
 
-        if won:
-            trade.pnl = (1.0 - trade.price) * trade.size  # profit per share
-            self.consecutive_losses = 0
+        if trade.is_sell:
+            # Sell-side P&L:
+            # WIN: contract resolves to $0, we keep the sell proceeds
+            #   P&L = sell_price × shares
+            # LOSS: contract resolves to $1, we pay (1 - sell_price) × shares
+            shares = trade.size / trade.price if trade.price > 0 else 0
+            risk_amount = (1.0 - trade.price) * shares
+            self.total_exposure -= risk_amount
+            if won:
+                trade.pnl = trade.price * shares  # keep the $0.51 per share
+                self.consecutive_losses = 0
+            else:
+                trade.pnl = -risk_amount  # pay (1-0.51) = $0.49 per share
+                self.consecutive_losses += 1
         else:
-            trade.pnl = -cost
-            self.consecutive_losses += 1
+            # Buy-side P&L (standard)
+            cost = trade.price * trade.size
+            self.total_exposure -= cost
+            if won:
+                trade.pnl = (1.0 - trade.price) * trade.size
+                self.consecutive_losses = 0
+            else:
+                trade.pnl = -cost
+                self.consecutive_losses += 1
 
         self.daily_pnl += trade.pnl
         logger.info(
