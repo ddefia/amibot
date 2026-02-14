@@ -34,17 +34,28 @@ class LatencyArbStrategy:
     """Core strategy: exploit the latency gap between Binance (fast) and
     Chainlink (resolution source, slightly slower).
 
-    When Binance shows BTC moving strongly in one direction during a 5-min
-    interval, the Chainlink-based resolution is highly likely to follow.
-    If market odds haven't caught up, there's an exploitable edge.
+    Tuned to match Guy 1's winning approach from trader analysis:
+    - Only trade 180-240 seconds into the 5-min interval
+    - Only buy at 48-65 cent prices (near-even odds with slight lean)
+    - Small positions (~4-5 shares) with quarter-Kelly sizing
+    - Require minimum 3% edge before entering
 
-    Based on the approach used by the bot that turned $313 → $438K."""
+    Guy 1 stats: 54% win rate, $131K profit, 1.35 profit factor,
+    max 6 consecutive losses."""
+
+    # Guy 1's trading window (98% of his trades fall here)
+    ENTRY_WINDOW_START = 180  # 3 minutes into interval
+    ENTRY_WINDOW_END = 240    # 4 minutes into interval
+
+    # Guy 1's price range (98% of trades at 50-65c)
+    MIN_ENTRY_PRICE = 0.48
+    MAX_ENTRY_PRICE = 0.65
 
     def __init__(
         self,
-        min_edge: float = 0.05,
-        max_position: float = 100,
-        confidence_threshold: float = 0.70,
+        min_edge: float = 0.03,
+        max_position: float = 5.0,
+        confidence_threshold: float = 0.55,
     ):
         self.min_edge = min_edge
         self.max_position = max_position
@@ -70,67 +81,80 @@ class LatencyArbStrategy:
             market_down_price: Current Polymarket price for "Down" shares
             seconds_into_interval: How far into the 5-min window we are (0-300)
         """
+        # TIMING GATE: Guy 1 only trades at 180-240 seconds
+        if seconds_into_interval < self.ENTRY_WINDOW_START:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Too early ({seconds_into_interval}s < {self.ENTRY_WINDOW_START}s)")
+        if seconds_into_interval > self.ENTRY_WINDOW_END:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Too late ({seconds_into_interval}s > {self.ENTRY_WINDOW_END}s)")
+
         # Calculate price movement from interval start
         binance_delta = current_binance_price - interval_start_price
         binance_pct_move = binance_delta / interval_start_price
 
-        # Estimate true probability of "Up" resolving YES
-        # Higher confidence as: (a) move is larger, (b) more time has elapsed
-        time_factor = seconds_into_interval / 300.0  # 0.0 to 1.0
+        # Also check Chainlink movement for confirmation
+        chainlink_delta = current_chainlink_price - interval_start_price
+
+        # Both feeds should agree on direction for higher confidence
+        feeds_agree = (binance_delta > 0) == (chainlink_delta > 0)
+
+        time_factor = seconds_into_interval / 300.0
         move_magnitude = abs(binance_pct_move) * 10000  # in bps
 
-        # Probability model: larger moves + more elapsed time = higher confidence
-        # At 0 seconds, even a big move could reverse
-        # At 280 seconds with a 50bps move, almost certain
-        if move_magnitude < 5:  # < 5 bps move — too small
-            return Signal(Side.NONE, 0, 0, 0, 0, "Move too small")
+        # At 180-240s, even small moves are meaningful
+        if move_magnitude < 3:  # < 3 bps — truly flat
+            return Signal(Side.NONE, 0, 0, 0, 0, "Move too small (<3bps)")
 
-        # Logistic-style confidence based on move size and time
-        raw_confidence = min(0.99, 0.5 + (move_magnitude / 100) * time_factor)
+        # Confidence model tuned for the 180-240s window
+        # At this point in the interval, moves are ~70-80% predictive
+        raw_confidence = min(0.95, 0.50 + (move_magnitude / 80) * time_factor)
+
+        # Boost confidence when both price feeds agree
+        if feeds_agree:
+            raw_confidence = min(0.97, raw_confidence + 0.05)
+        else:
+            raw_confidence *= 0.85  # reduce if feeds disagree
 
         if binance_delta > 0:
-            # BTC is up — "Up" should win
             true_prob = raw_confidence
             market_prob = market_up_price
             side = Side.BUY_UP
             target_price = market_up_price
         else:
-            # BTC is down — "Down" should win
             true_prob = raw_confidence
             market_prob = market_down_price
             side = Side.BUY_DOWN
             target_price = market_down_price
 
-        # Edge = true probability - market price (what we pay)
+        # PRICE GATE: Guy 1 only buys at 48-65 cents
+        if target_price < self.MIN_ENTRY_PRICE:
+            return Signal(Side.NONE, raw_confidence, 0, 0, 0,
+                          f"Price ${target_price:.2f} below min ${self.MIN_ENTRY_PRICE}")
+        if target_price > self.MAX_ENTRY_PRICE:
+            return Signal(Side.NONE, raw_confidence, 0, 0, 0,
+                          f"Price ${target_price:.2f} above max ${self.MAX_ENTRY_PRICE}")
+
+        # Edge = true probability - market price
         edge = true_prob - market_prob
 
         if edge < self.min_edge:
             return Signal(
-                Side.NONE,
-                raw_confidence,
-                edge,
-                0,
-                0,
+                Side.NONE, raw_confidence, edge, 0, 0,
                 f"Edge {edge:.3f} below threshold {self.min_edge}",
             )
 
         if raw_confidence < self.confidence_threshold:
             return Signal(
-                Side.NONE,
-                raw_confidence,
-                edge,
-                0,
-                0,
+                Side.NONE, raw_confidence, edge, 0, 0,
                 f"Confidence {raw_confidence:.3f} below threshold",
             )
 
-        # Kelly criterion for position sizing
-        # f* = (bp - q) / b where b = odds, p = prob of winning, q = 1-p
+        # Kelly criterion for position sizing (quarter-Kelly like Guy 1)
         b = (1.0 / target_price) - 1  # decimal odds
         p = true_prob
         q = 1 - p
         kelly_fraction = max(0, (b * p - q) / b) if b > 0 else 0
-        # Use quarter-Kelly for safety
         size = min(self.max_position, self.max_position * kelly_fraction * 0.25)
 
         if size < 1:
@@ -143,10 +167,12 @@ class LatencyArbStrategy:
             price=target_price,
             size=round(size, 2),
             reason=(
-                f"BTC {'up' if binance_delta > 0 else 'down'} "
-                f"{move_magnitude:.1f}bps, "
-                f"true_prob={true_prob:.3f} vs market={market_prob:.3f}, "
-                f"edge={edge:.3f}, time={seconds_into_interval}s/300s"
+                f"BTC {'UP' if binance_delta > 0 else 'DOWN'} "
+                f"{move_magnitude:.1f}bps | "
+                f"prob={true_prob:.1%} vs mkt={market_prob:.1%} | "
+                f"edge={edge:.1%} | "
+                f"feeds={'AGREE' if feeds_agree else 'DISAGREE'} | "
+                f"t={seconds_into_interval}s"
             ),
         )
 

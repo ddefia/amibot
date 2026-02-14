@@ -112,8 +112,10 @@ class BotEngine:
         if not self.price_feed.latest_binance or not self.price_feed.latest_chainlink:
             return
 
-        # Don't trade in first 10 seconds (let prices settle) or last 15 (too late)
-        if seconds_into_interval < 10 or seconds_into_interval > 285:
+        # Guy 1's window: only trade at 180-240s into the interval
+        # Before 170s: too early, direction not established
+        # After 250s: too late, odds already adjusted, spreads widen
+        if seconds_into_interval < 170 or seconds_into_interval > 250:
             return
 
         # Already have a position this interval? Skip
