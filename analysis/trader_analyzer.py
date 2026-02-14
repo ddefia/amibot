@@ -532,6 +532,9 @@ class TraderAnalyzer:
 
         df = df.rename(columns=col_map)
 
+        # Drop duplicate columns (keep first occurrence)
+        df = df.loc[:, ~df.columns.duplicated()]
+
         # Parse timestamps
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -542,8 +545,11 @@ class TraderAnalyzer:
         # Coerce numeric columns
         for col in ["entry_price", "exit_price", "size", "pnl", "fee"]:
             if col in df.columns:
+                series = df[col]
+                if isinstance(series, pd.DataFrame):
+                    series = series.iloc[:, 0]
                 df[col] = pd.to_numeric(
-                    df[col].astype(str).str.replace(r"[$,]", "", regex=True),
+                    series.astype(str).str.replace(r"[$,]", "", regex=True),
                     errors="coerce",
                 )
 
