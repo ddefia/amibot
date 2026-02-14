@@ -169,12 +169,9 @@ class BotEngine:
                 logger.warning("No active BTC market found — waiting")
                 return
 
-        # ---- REFRESH MARKET PRICES (every 15s for hourly/daily markets) ----
-        if self.current_market and (time.time() - self._last_market_refresh) > 15:
-            refreshed = self.market_finder.get_best_market()
-            if refreshed:
-                self.current_parsed = self.market_finder.parse_market(refreshed)
-                self.current_market = refreshed
+        # ---- REFRESH MARKET PRICES via CLOB API (every 5s for live prices) ----
+        if self.current_parsed and (time.time() - self._last_market_refresh) > 5:
+            self._refresh_clob_prices()
             self._last_market_refresh = time.time()
 
         # ---- PERIODIC BALANCE REFRESH ----
@@ -313,6 +310,11 @@ class BotEngine:
                 "edge": signal.edge,
                 "interval_duration": self.interval_duration,
                 "seconds_in": seconds_into_interval,
+                "market": parsed.get("question", ""),
+                "binance_price": self.price_feed.latest_binance.price,
+                "interval_start_price": self.interval_start_price,
+                "up_price": up_token.get("price"),
+                "down_price": down_token.get("price"),
             })
         else:
             logger.warning("Order failed: %s", result.error)
@@ -378,6 +380,10 @@ class BotEngine:
                 "pnl": trade.pnl,
                 "price": trade.price,
                 "size": trade.size,
+                "direction": direction,
+                "open_price": self.interval_start_price,
+                "close_price": close_price,
+                "delta_pct": delta_pct,
             })
 
         if resolved_count > 0:
@@ -391,6 +397,31 @@ class BotEngine:
                 stats["total_pnl"],
                 stats["consecutive_losses"],
             )
+
+    def _refresh_clob_prices(self):
+        """Fetch live Up/Down prices from the CLOB order book API.
+
+        Uses /price?token_id=X&side=SELL for each token to get the current
+        best ask price (what it costs to buy the contract right now).
+        """
+        if not self.current_parsed:
+            return
+        try:
+            for label in ("UP", "DOWN"):
+                token_info = self.current_parsed["tokens"].get(label)
+                if not token_info or not token_info.get("token_id"):
+                    continue
+                resp = self.market_finder.client.get(
+                    f"{self.config.clob_host}/price",
+                    params={"token_id": token_info["token_id"], "side": "BUY"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    price = float(data.get("price", 0))
+                    if price > 0:
+                        token_info["price"] = price
+        except Exception as e:
+            logger.debug("CLOB price refresh failed: %s", e)
 
     async def _on_price_tick(self, tick: PriceTick):
         """Handle incoming price ticks — monitor for feed gaps."""
