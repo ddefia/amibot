@@ -82,6 +82,7 @@ class BotEngine:
         balance = self.executor.get_balance()
         if balance is not None:
             logger.info("Available balance: $%.2f USDC", balance)
+            self.risk.set_balance(balance)
 
         # Register price tick handler
         self.price_feed.on_tick(self._on_price_tick)
@@ -142,6 +143,9 @@ class BotEngine:
             self.positions_this_interval = 0
             self.total_active_usd = 0
 
+            # Reset per-interval bankroll tracking
+            self.risk.reset_interval_deployed()
+
             # Cancel stale orders from previous interval
             self.executor.cancel_all()
 
@@ -170,6 +174,12 @@ class BotEngine:
             else:
                 logger.warning("No active BTC market found — waiting")
                 return
+
+        # ---- PERIODIC BALANCE REFRESH ----
+        if self.risk.needs_balance_refresh():
+            balance = self.executor.get_balance()
+            if balance is not None:
+                self.risk.set_balance(balance)
 
         # ---- SKIP CHECKS ----
         if not self.current_market or not self.interval_start_price:
@@ -202,7 +212,8 @@ class BotEngine:
         if not up_token.get("price") or not down_token.get("price"):
             return
 
-        # ---- EVALUATE STRATEGY ----
+        # ---- EVALUATE STRATEGY (with volume confirmation) ----
+        volume_stats = self.price_feed.get_volume_stats()
         signal = self.latency_arb.evaluate(
             interval_start_price=self.interval_start_price,
             current_binance_price=self.price_feed.latest_binance.price,
@@ -212,6 +223,7 @@ class BotEngine:
             seconds_into_interval=seconds_into_interval,
             interval_duration=self.interval_duration,
             current_exposure_usd=self.total_active_usd,
+            volume_stats=volume_stats,
         )
 
         # Fallback: mispricing (pure arb when Up+Down < $1.00)

@@ -60,6 +60,23 @@ class Config:
         default_factory=lambda: _env_int("MAX_POSITIONS_PER_INTERVAL", "3")
     )
 
+    # Bankroll protection — percentage-based limits tied to ACTUAL balance
+    max_pct_per_trade: float = field(
+        default_factory=lambda: _env_float("MAX_PCT_PER_TRADE", "0.05")
+    )  # Max 5% of bankroll on any single trade
+    max_pct_per_interval: float = field(
+        default_factory=lambda: _env_float("MAX_PCT_PER_INTERVAL", "0.15")
+    )  # Max 15% of bankroll deployed in any single interval
+    max_pct_total_exposure: float = field(
+        default_factory=lambda: _env_float("MAX_PCT_TOTAL_EXPOSURE", "0.40")
+    )  # Max 40% of bankroll in total active exposure
+    drawdown_halt_pct: float = field(
+        default_factory=lambda: _env_float("DRAWDOWN_HALT_PCT", "0.20")
+    )  # Stop trading if equity drops 20% from session start
+    balance_refresh_interval: float = field(
+        default_factory=lambda: _env_float("BALANCE_REFRESH_INTERVAL", "60")
+    )  # Re-check actual balance every 60 seconds
+
     # Execution
     fill_check_interval_seconds: float = field(
         default_factory=lambda: _env_float("FILL_CHECK_INTERVAL", "5")

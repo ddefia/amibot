@@ -100,6 +100,15 @@ class LatencyArbStrategy:
     # Stronger penalty than before — disagreement means low conviction
     FEED_DISAGREE_PENALTY = 0.75  # 25% confidence cut (was 15%)
 
+    # Volume confirmation: high-volume moves sustain direction, low-volume = fakeout
+    # volume_ratio = current volume / EMA volume (from Binance rolling window)
+    HIGH_VOLUME_THRESHOLD = 1.5    # 50% above average = strong move
+    LOW_VOLUME_THRESHOLD = 0.5     # 50% below average = weak/fakeout
+    HIGH_VOLUME_CONF_BOOST = 0.06  # +6% confidence on high volume
+    LOW_VOLUME_CONF_PENALTY = 0.85 # 15% confidence cut on low volume
+    # Buy/sell ratio alignment: if buyers dominate during an up-move, extra confirmation
+    VOLUME_DIRECTION_BOOST = 0.03  # +3% confidence when volume direction agrees
+
     # Cross-trader lesson: scale position size with confidence (r=0.14 correlation)
     # Higher confidence → bigger position (like winners across all traders)
     MIN_CONFIDENCE_SIZE_SCALE = 0.6   # At minimum confidence, use 60% of position_usd
@@ -125,6 +134,7 @@ class LatencyArbStrategy:
         seconds_into_interval: int,
         interval_duration: int = 900,
         current_exposure_usd: float = 0,
+        volume_stats: dict | None = None,
     ) -> Signal:
         """Evaluate whether there's a tradeable latency arb opportunity.
 
@@ -138,6 +148,8 @@ class LatencyArbStrategy:
             seconds_into_interval: How far into the interval we are
             interval_duration: Total interval duration in seconds (300 or 900)
             current_exposure_usd: Current total active position exposure in USD
+            volume_stats: Rolling volume data from PriceFeed.get_volume_stats()
+                         Keys: volume_ratio, buy_ratio, total_usd, trade_count
         """
         # EXPOSURE GATE: Don't exceed max active exposure (Guy 1 keeps it ~$2,837)
         if current_exposure_usd >= self.MAX_ACTIVE_EXPOSURE:
@@ -185,6 +197,32 @@ class LatencyArbStrategy:
             raw_confidence = min(0.97, raw_confidence + 0.05)
         else:
             raw_confidence *= self.FEED_DISAGREE_PENALTY  # 25% cut (was 15%)
+
+        # VOLUME CONFIRMATION: high-volume moves sustain, low-volume = fakeout
+        volume_label = ""
+        if volume_stats and volume_stats.get("trade_count", 0) > 10:
+            vol_ratio = volume_stats.get("volume_ratio", 1.0)
+            buy_ratio = volume_stats.get("buy_ratio", 0.5)
+
+            # Volume magnitude: is this move happening on real volume?
+            if vol_ratio >= self.HIGH_VOLUME_THRESHOLD:
+                raw_confidence = min(0.97, raw_confidence + self.HIGH_VOLUME_CONF_BOOST)
+                volume_label = f"HIGH vol({vol_ratio:.1f}x)"
+            elif vol_ratio <= self.LOW_VOLUME_THRESHOLD:
+                raw_confidence *= self.LOW_VOLUME_CONF_PENALTY
+                volume_label = f"LOW vol({vol_ratio:.1f}x)"
+            else:
+                volume_label = f"vol({vol_ratio:.1f}x)"
+
+            # Volume direction alignment: are buyers or sellers driving the move?
+            # BTC going UP + buy_ratio > 0.55 = buyers driving it = more conviction
+            # BTC going UP + buy_ratio < 0.45 = sellers dominating but price up = suspicious
+            if binance_delta > 0 and buy_ratio > 0.55:
+                raw_confidence = min(0.97, raw_confidence + self.VOLUME_DIRECTION_BOOST)
+                volume_label += " buy-driven"
+            elif binance_delta < 0 and buy_ratio < 0.45:
+                raw_confidence = min(0.97, raw_confidence + self.VOLUME_DIRECTION_BOOST)
+                volume_label += " sell-driven"
 
         # SELL-SIDE LOGIC (Guy 1's actual approach):
         # Sell the contract on the LOSING side (the one about to go to $0)
@@ -264,6 +302,7 @@ class LatencyArbStrategy:
                 f"{move_magnitude:.1f}bps | "
                 f"conf={raw_confidence:.1%} edge={edge:.1%} | "
                 f"feeds={'AGREE' if feeds_agree else 'DISAGREE'} | "
+                f"{volume_label + ' | ' if volume_label else ''}"
                 f"t={seconds_into_interval}s/{interval_duration}s"
             ),
         )
