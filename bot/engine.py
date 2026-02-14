@@ -1,5 +1,9 @@
 """Main bot engine: ties together market discovery, price feeds, strategies,
-risk management, and order execution into a single async loop."""
+risk management, and order execution into a single async loop.
+
+Updated based on deep trade-by-trade analysis of 5 Polymarket traders.
+Now supports SELL-side maker orders (Guy 1's exact strategy) and
+15-min interval detection in addition to 5-min."""
 
 import asyncio
 import time
@@ -17,11 +21,13 @@ logger = logging.getLogger(__name__)
 
 class BotEngine:
     """The main trading engine. Runs an async loop that:
-    1. Discovers the current 5-min BTC market
+    1. Discovers the current BTC market (5-min or 15-min intervals)
     2. Streams real-time prices from Binance + Chainlink
-    3. Evaluates trading signals via the selected strategy
-    4. Executes orders when edge > threshold, subject to risk limits
+    3. Evaluates SELL signals via latency arb strategy (Guy 1's approach)
+    4. Places SELL maker orders at $0.51 when edge detected
     5. Tracks positions and P&L through resolution
+
+    Based on Guy 1 (dys123): Sharpe 18.62, $131.6k P&L, 53.7% WR.
     """
 
     def __init__(self, config: Config):
@@ -34,7 +40,8 @@ class BotEngine:
         # Strategies
         self.latency_arb = LatencyArbStrategy(
             min_edge=config.min_edge_threshold,
-            max_position=config.max_position_size,
+            confidence_threshold=0.55,
+            position_usd=1500,
         )
         self.mispricing = MispricingStrategy(
             max_position=config.max_position_size,
@@ -44,13 +51,15 @@ class BotEngine:
         self.current_market: dict | None = None
         self.interval_start_price: float | None = None
         self.interval_start_ts: int = 0
-        self.active_position: dict | None = None
+        self.interval_duration: int = 900  # Default 15-min, detect from market
+        self.active_positions: list[dict] = []  # Track multiple positions
+        self.total_active_usd: float = 0
         self._running = False
 
     async def run(self):
         """Main entry point — start the bot."""
         self._running = True
-        logger.info("Bot starting with strategy: %s", self.config.strategy)
+        logger.info("Bot starting — SELL-side latency arb strategy (Guy 1 mode)")
 
         balance = self.executor.get_balance()
         if balance is not None:
@@ -74,17 +83,50 @@ class BotEngine:
                 logger.exception("Error in trading loop tick")
             await asyncio.sleep(1)
 
+    def _detect_interval_duration(self) -> int:
+        """Detect interval duration from the current market slug/name.
+        Guy 1 trades 99.6% on 15-min intervals, Guy 4 uses both 5 and 15."""
+        if not self.current_market:
+            return 900
+
+        slug = str(self.current_market.get("question", ""))
+        # Parse time range like "6:15PM-6:30PM" to determine duration
+        import re
+        m = re.search(r'(\d+):(\d+)(AM|PM)\s*-\s*(\d+):(\d+)(AM|PM)', slug)
+        if m:
+            h1, m1, ap1 = int(m.group(1)), int(m.group(2)), m.group(3)
+            h2, m2, ap2 = int(m.group(4)), int(m.group(5)), m.group(6)
+            # Convert to minutes
+            t1 = (h1 % 12 + (12 if ap1 == 'PM' else 0)) * 60 + m1
+            t2 = (h2 % 12 + (12 if ap2 == 'PM' else 0)) * 60 + m2
+            diff = (t2 - t1) * 60  # seconds
+            if diff > 0:
+                return diff
+
+        # Check for hour-based patterns like "5PM ET" vs "5:00PM-5:15PM ET"
+        if re.search(r'\d+[AP]M\s+ET\s*-\s*(Yes|No|Up|Down)', slug):
+            return 3600  # hourly
+
+        return 900  # default 15-min
+
     async def _tick(self):
         """Single iteration of the trading loop."""
         now = int(time.time())
-        current_interval = now - (now % 300)
-        seconds_into_interval = now % 300
+
+        # Detect interval boundaries
+        # For 15-min: interval = now - (now % 900)
+        # For 5-min: interval = now - (now % 300)
+        interval_mod = self.interval_duration if self.interval_duration > 0 else 900
+        current_interval = now - (now % interval_mod)
+        seconds_into_interval = now % interval_mod
 
         # New interval — find the market and record opening price
         if current_interval != self.interval_start_ts:
-            logger.info("New 5-min interval starting at %d", current_interval)
+            logger.info("New %d-min interval starting at %d",
+                        interval_mod // 60, current_interval)
             self.interval_start_ts = current_interval
-            self.active_position = None
+            self.active_positions = []
+            self.total_active_usd = 0
 
             # Cancel any stale orders from previous interval
             self.executor.cancel_all()
@@ -101,9 +143,11 @@ class BotEngine:
             self.current_market = self.market_finder.get_current_market()
             if self.current_market:
                 parsed = self.market_finder.parse_market(self.current_market)
-                logger.info("Active market: %s", parsed["slug"])
+                self.interval_duration = self._detect_interval_duration()
+                logger.info("Active market: %s (%d-min interval)",
+                            parsed["slug"], self.interval_duration // 60)
             else:
-                logger.warning("No active market found for interval %d", current_interval)
+                logger.warning("No active market found")
                 return
 
         # Skip if we don't have the data we need
@@ -112,16 +156,7 @@ class BotEngine:
         if not self.price_feed.latest_binance or not self.price_feed.latest_chainlink:
             return
 
-        # Guy 1's window: only trade at 180-240s into the interval
-        # Before 170s: too early, direction not established
-        # After 250s: too late, odds already adjusted, spreads widen
-        if seconds_into_interval < 170 or seconds_into_interval > 250:
-            return
-
-        # Already have a position this interval? Skip
-        if self.active_position:
-            return
-
+        # The strategy handles its own timing window internally
         parsed = self.market_finder.parse_market(self.current_market)
         up_token = parsed["tokens"].get("UP", {})
         down_token = parsed["tokens"].get("DOWN", {})
@@ -129,7 +164,7 @@ class BotEngine:
         if not up_token.get("price") or not down_token.get("price"):
             return
 
-        # Evaluate strategy
+        # Evaluate SELL-side latency arb (primary strategy)
         signal = self.latency_arb.evaluate(
             interval_start_price=self.interval_start_price,
             current_binance_price=self.price_feed.latest_binance.price,
@@ -137,31 +172,30 @@ class BotEngine:
             market_up_price=up_token["price"],
             market_down_price=down_token["price"],
             seconds_into_interval=seconds_into_interval,
+            interval_duration=self.interval_duration,
+            current_exposure_usd=self.total_active_usd,
         )
 
-        # Also check mispricing
-        mispricing_signal = self.mispricing.evaluate(
-            market_up_price=up_token["price"],
-            market_down_price=down_token["price"],
-        )
+        # Fallback: check mispricing (pure arb when Up+Down < $1.00)
+        if signal.side == Side.NONE:
+            mispricing_signal = self.mispricing.evaluate(
+                market_up_price=up_token["price"],
+                market_down_price=down_token["price"],
+            )
+            if mispricing_signal.side != Side.NONE:
+                signal = mispricing_signal
 
-        # Use the signal with the higher edge
-        best = signal if signal.edge >= mispricing_signal.edge else mispricing_signal
-
-        if best.side == Side.NONE:
+        if signal.side == Side.NONE:
             return
 
         # Risk check
-        allowed, reason = self.risk.check_allowed(best)
+        allowed, reason = self.risk.check_allowed(signal)
         if not allowed:
             logger.debug("Trade blocked by risk manager: %s", reason)
             return
 
-        # Adjust size
-        best.size = self.risk.adjust_size(best)
-
-        # Select token
-        if best.side == Side.BUY_UP:
+        # Select token based on signal side
+        if signal.side in (Side.BUY_UP, Side.SELL_UP):
             token_id = up_token["token_id"]
         else:
             token_id = down_token["token_id"]
@@ -169,22 +203,33 @@ class BotEngine:
         if not token_id:
             return
 
+        # Determine if this is a sell order
+        is_sell = signal.side in (Side.SELL_UP, Side.SELL_DOWN)
+
         # Execute
-        logger.info("SIGNAL: %s", best.reason)
+        logger.info("SIGNAL: %s", signal.reason)
         result = self.executor.place_order(
-            signal=best,
+            signal=signal,
             token_id=token_id,
             post_only=self.config.maker_only,
+            is_sell=is_sell,
         )
 
         if result.success:
-            self.risk.record_trade(best)
-            self.active_position = {
-                "signal": best,
+            self.risk.record_trade(signal)
+            position = {
+                "signal": signal,
                 "order_id": result.order_id,
                 "interval": self.interval_start_ts,
+                "usd_amount": signal.size,
             }
-            logger.info("Position opened: %s", result.order_id)
+            self.active_positions.append(position)
+            self.total_active_usd += signal.size
+            logger.info("Position opened: %s | Side: %s | $%.0f | Active: $%.0f",
+                        result.order_id,
+                        "SELL" if is_sell else "BUY",
+                        signal.size,
+                        self.total_active_usd)
         else:
             logger.warning("Order failed: %s", result.error)
 

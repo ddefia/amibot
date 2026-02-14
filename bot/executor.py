@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from bot.strategies import Signal, Side
 
@@ -54,23 +54,30 @@ class Executor:
         signal: Signal,
         token_id: str,
         post_only: bool = True,
+        is_sell: bool = False,
     ) -> OrderResult:
         """Place a limit order based on a strategy signal.
 
         Args:
             signal: The trading signal with side, price, and size
-            token_id: The ERC-1155 token ID for the outcome to buy
+            token_id: The ERC-1155 token ID for the outcome token
             post_only: If True, order must be maker-only (no taker fees)
+            is_sell: If True, place a SELL order (Guy 1's strategy)
         """
         if signal.side == Side.NONE:
             return OrderResult(False, None, "no_signal", "Signal is NONE")
 
         try:
+            # Guy 1's strategy: SELL overpriced contracts at 0.51
+            # Size for sell orders is in shares (USD / price)
+            order_side = SELL if is_sell else BUY
+            order_size = signal.size / signal.price if is_sell else signal.size
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=signal.price,
-                size=signal.size,
-                side=BUY,
+                size=round(order_size, 2),
+                side=order_side,
             )
 
             from py_clob_client.clob_types import OrderType

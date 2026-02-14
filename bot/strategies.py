@@ -1,8 +1,15 @@
-"""Trading strategies for BTC 5-min Polymarket markets.
+"""Trading strategies for BTC 5-min/15-min Polymarket markets.
 
-Implements the key strategies observed from successful traders:
-1. Latency Arbitrage — exploit the gap between Binance and Chainlink prices
-2. Mispricing — buy when market odds diverge from calculated probability
+Implements strategies reverse-engineered from deep trade-by-trade analysis
+of 5 real Polymarket traders (PDF reports, CSV data, screenshots):
+
+1. Latency Arb SELL Strategy — Guy 1's exact approach (Sharpe 18.62)
+   SELL overpriced contracts at 0.51 when Binance price gives directional signal.
+   100% of Guy 1's captured fills are SELL-side at exactly $0.51.
+
+2. Multi-Asset Buy Strategy — Guy 3's approach (Sharpe 9.47, $356.9k PnL)
+   BUY underpriced contracts across BTC/ETH/SOL/XRP simultaneously.
+
 3. Market Making — provide liquidity on both sides, earn spread + rebates
 """
 
@@ -17,6 +24,8 @@ logger = logging.getLogger(__name__)
 class Side(Enum):
     BUY_UP = "buy_up"
     BUY_DOWN = "buy_down"
+    SELL_UP = "sell_up"      # Sell "Up/Yes" contracts (short Up)
+    SELL_DOWN = "sell_down"  # Sell "Down/No" contracts (short Down)
     NONE = "none"
 
 
@@ -26,40 +35,62 @@ class Signal:
     confidence: float  # 0.0 to 1.0
     edge: float  # expected profit per $1 risked
     price: float  # limit price to use
-    size: float  # suggested position size in shares
+    size: float  # suggested position size in USD
     reason: str
 
 
 class LatencyArbStrategy:
-    """Core strategy: exploit the latency gap between Binance (fast) and
-    Chainlink (resolution source, slightly slower).
+    """Core strategy: SELL overpriced contracts using Binance price as lead signal.
 
-    Tuned to match Guy 1's winning approach from trader analysis:
-    - Only trade 180-240 seconds into the 5-min interval
-    - Only buy at 48-65 cent prices (near-even odds with slight lean)
-    - Small positions (~4-5 shares) with quarter-Kelly sizing
-    - Require minimum 3% edge before entering
+    Reverse-engineered from Guy 1 (dys123) — the best risk-adjusted trader:
+    - Sharpe Ratio: 18.62 (Exceptional)
+    - ALL-TIME P&L: $131.6k (Rank #801)
+    - Win Rate: 53.7% across 467 positions
+    - Profit Factor: 1.35
+    - 100% BTC markets, 100% SELL-side fills at $0.51
+    - Position sizes: $1,000-$2,000 (70% of positions)
+    - Active exposure: only $2,837 at any time
+    - 99.6% on 15-min intervals
 
-    Guy 1 stats: 54% win rate, $131K profit, 1.35 profit factor,
-    max 6 consecutive losses."""
+    HOW IT WORKS:
+    Guy 1 sells contracts that are about to become worthless:
+    - If Binance shows BTC going UP → the "Down/No" contract is overpriced
+      → SELL "Down" at 0.51, collect $0.51, pay $0.00 at resolution = $0.51 profit
+    - If Binance shows BTC going DOWN → the "Up/Yes" contract is overpriced
+      → SELL "Up" at 0.51, collect $0.51, pay $0.00 at resolution = $0.51 profit
 
-    # Guy 1's trading window (98% of his trades fall here)
-    ENTRY_WINDOW_START = 180  # 3 minutes into interval
-    ENTRY_WINDOW_END = 240    # 4 minutes into interval
+    The key edge: Polymarket market prices lag Binance by seconds.
+    By the time the market adjusts, Guy 1 has already sold at stale prices."""
 
-    # Guy 1's price range (98% of trades at 50-65c)
-    MIN_ENTRY_PRICE = 0.48
-    MAX_ENTRY_PRICE = 0.65
+    # Timing window — trades in the second half of intervals
+    # 15-min intervals: trade at 600-780s (10-13 min mark)
+    # 5-min intervals: trade at 180-260s (3-4.3 min mark)
+    ENTRY_WINDOW_15M_START = 600   # 10 min into 15-min interval
+    ENTRY_WINDOW_15M_END = 780     # 13 min into 15-min interval
+    ENTRY_WINDOW_5M_START = 180    # 3 min into 5-min interval
+    ENTRY_WINDOW_5M_END = 260      # 4.3 min into 5-min interval
+
+    # Guy 1's exact price: 97.6% of fills at $0.51
+    SELL_PRICE = 0.51
+
+    # Price gate — only sell when contract is in this range
+    MIN_SELL_PRICE = 0.48  # Don't sell below this (too cheap = risky)
+    MAX_SELL_PRICE = 0.55  # Don't sell above this (too expensive = market already moved)
+
+    # Position sizing from Guy 1's data
+    DEFAULT_POSITION_USD = 1500    # $1,500 per position (median ~$1,200)
+    MAX_POSITION_USD = 5000        # Hard cap per single market
+    MAX_ACTIVE_EXPOSURE = 10000    # Total across all active positions
 
     def __init__(
         self,
         min_edge: float = 0.03,
-        max_position: float = 5.0,
         confidence_threshold: float = 0.55,
+        position_usd: float = 1500,
     ):
         self.min_edge = min_edge
-        self.max_position = max_position
         self.confidence_threshold = confidence_threshold
+        self.position_usd = min(position_usd, self.MAX_POSITION_USD)
 
     def evaluate(
         self,
@@ -69,110 +100,123 @@ class LatencyArbStrategy:
         market_up_price: float,
         market_down_price: float,
         seconds_into_interval: int,
+        interval_duration: int = 900,
+        current_exposure_usd: float = 0,
     ) -> Signal:
         """Evaluate whether there's a tradeable latency arb opportunity.
 
         Args:
-            interval_start_price: BTC price at the start of this 5-min interval
-                                  (from Chainlink oracle)
-            current_binance_price: Latest BTC price from Binance
+            interval_start_price: BTC price at the start of this interval
+                                  (from Chainlink oracle snapshot)
+            current_binance_price: Latest BTC price from Binance (fast feed)
             current_chainlink_price: Latest BTC price from Chainlink RTDS
-            market_up_price: Current Polymarket price for "Up" shares
-            market_down_price: Current Polymarket price for "Down" shares
-            seconds_into_interval: How far into the 5-min window we are (0-300)
+            market_up_price: Current Polymarket price for "Up/Yes" shares
+            market_down_price: Current Polymarket price for "Down/No" shares
+            seconds_into_interval: How far into the interval we are
+            interval_duration: Total interval duration in seconds (300 or 900)
+            current_exposure_usd: Current total active position exposure in USD
         """
-        # TIMING GATE: Guy 1 only trades at 180-240 seconds
-        if seconds_into_interval < self.ENTRY_WINDOW_START:
+        # EXPOSURE GATE: Don't exceed max active exposure (Guy 1 keeps it ~$2,837)
+        if current_exposure_usd >= self.MAX_ACTIVE_EXPOSURE:
             return Signal(Side.NONE, 0, 0, 0, 0,
-                          f"Too early ({seconds_into_interval}s < {self.ENTRY_WINDOW_START}s)")
-        if seconds_into_interval > self.ENTRY_WINDOW_END:
-            return Signal(Side.NONE, 0, 0, 0, 0,
-                          f"Too late ({seconds_into_interval}s > {self.ENTRY_WINDOW_END}s)")
+                          f"Exposure ${current_exposure_usd:.0f} >= max ${self.MAX_ACTIVE_EXPOSURE}")
 
-        # Calculate price movement from interval start
+        # TIMING GATE: Select window based on interval duration
+        if interval_duration >= 900:  # 15-min interval
+            window_start = self.ENTRY_WINDOW_15M_START
+            window_end = self.ENTRY_WINDOW_15M_END
+        else:  # 5-min interval
+            window_start = self.ENTRY_WINDOW_5M_START
+            window_end = self.ENTRY_WINDOW_5M_END
+
+        if seconds_into_interval < window_start:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Too early ({seconds_into_interval}s < {window_start}s)")
+        if seconds_into_interval > window_end:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Too late ({seconds_into_interval}s > {window_end}s)")
+
+        # Calculate directional signal from Binance (fast feed)
         binance_delta = current_binance_price - interval_start_price
         binance_pct_move = binance_delta / interval_start_price
 
-        # Also check Chainlink movement for confirmation
+        # Chainlink confirmation
         chainlink_delta = current_chainlink_price - interval_start_price
-
-        # Both feeds should agree on direction for higher confidence
         feeds_agree = (binance_delta > 0) == (chainlink_delta > 0)
 
-        time_factor = seconds_into_interval / 300.0
+        time_factor = seconds_into_interval / interval_duration
         move_magnitude = abs(binance_pct_move) * 10000  # in bps
 
-        # At 180-240s, even small moves are meaningful
-        if move_magnitude < 3:  # < 3 bps — truly flat
+        # Need at least 3bps movement to have directional conviction
+        if move_magnitude < 3:
             return Signal(Side.NONE, 0, 0, 0, 0, "Move too small (<3bps)")
 
-        # Confidence model tuned for the 180-240s window
-        # At this point in the interval, moves are ~70-80% predictive
+        # Confidence model — later in interval = higher predictive power
         raw_confidence = min(0.95, 0.50 + (move_magnitude / 80) * time_factor)
 
-        # Boost confidence when both price feeds agree
+        # Dual feed confirmation bonus
         if feeds_agree:
             raw_confidence = min(0.97, raw_confidence + 0.05)
         else:
-            raw_confidence *= 0.85  # reduce if feeds disagree
+            raw_confidence *= 0.85
 
+        # SELL-SIDE LOGIC (Guy 1's actual approach):
+        # Sell the contract on the LOSING side (the one about to go to $0)
         if binance_delta > 0:
-            true_prob = raw_confidence
-            market_prob = market_up_price
-            side = Side.BUY_UP
-            target_price = market_up_price
-        else:
-            true_prob = raw_confidence
-            market_prob = market_down_price
-            side = Side.BUY_DOWN
+            # BTC going UP → "Down/No" contract will be worthless → SELL it
+            side = Side.SELL_DOWN
             target_price = market_down_price
+            # Edge = probability contract goes to 0 × sell price
+            # If we sell at 0.51 and it resolves to 0, we keep $0.51
+            edge = raw_confidence * target_price - (1 - raw_confidence) * (1 - target_price)
+        else:
+            # BTC going DOWN → "Up/Yes" contract will be worthless → SELL it
+            side = Side.SELL_UP
+            target_price = market_up_price
+            edge = raw_confidence * target_price - (1 - raw_confidence) * (1 - target_price)
 
-        # PRICE GATE: Guy 1 only buys at 48-65 cents
-        if target_price < self.MIN_ENTRY_PRICE:
-            return Signal(Side.NONE, raw_confidence, 0, 0, 0,
-                          f"Price ${target_price:.2f} below min ${self.MIN_ENTRY_PRICE}")
-        if target_price > self.MAX_ENTRY_PRICE:
-            return Signal(Side.NONE, raw_confidence, 0, 0, 0,
-                          f"Price ${target_price:.2f} above max ${self.MAX_ENTRY_PRICE}")
+        # PRICE GATE: Only sell in the sweet spot (Guy 1: 97.6% at 0.51)
+        if target_price < self.MIN_SELL_PRICE:
+            return Signal(Side.NONE, raw_confidence, edge, 0, 0,
+                          f"Price ${target_price:.2f} too low to sell (min ${self.MIN_SELL_PRICE})")
+        if target_price > self.MAX_SELL_PRICE:
+            return Signal(Side.NONE, raw_confidence, edge, 0, 0,
+                          f"Price ${target_price:.2f} too high to sell (max ${self.MAX_SELL_PRICE})")
 
-        # Edge = true probability - market price
-        edge = true_prob - market_prob
-
+        # EDGE GATE
         if edge < self.min_edge:
-            return Signal(
-                Side.NONE, raw_confidence, edge, 0, 0,
-                f"Edge {edge:.3f} below threshold {self.min_edge}",
-            )
+            return Signal(Side.NONE, raw_confidence, edge, 0, 0,
+                          f"Edge {edge:.3f} below threshold {self.min_edge}")
 
+        # CONFIDENCE GATE
         if raw_confidence < self.confidence_threshold:
-            return Signal(
-                Side.NONE, raw_confidence, edge, 0, 0,
-                f"Confidence {raw_confidence:.3f} below threshold",
-            )
+            return Signal(Side.NONE, raw_confidence, edge, 0, 0,
+                          f"Confidence {raw_confidence:.3f} below threshold")
 
-        # Kelly criterion for position sizing (quarter-Kelly like Guy 1)
-        b = (1.0 / target_price) - 1  # decimal odds
-        p = true_prob
-        q = 1 - p
-        kelly_fraction = max(0, (b * p - q) / b) if b > 0 else 0
-        size = min(self.max_position, self.max_position * kelly_fraction * 0.25)
+        # Position sizing — fixed USD amount like Guy 1
+        # Scale down if remaining exposure budget is small
+        remaining_budget = self.MAX_ACTIVE_EXPOSURE - current_exposure_usd
+        size_usd = min(self.position_usd, remaining_budget)
 
-        if size < 1:
+        if size_usd < 100:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0, "Size too small")
+
+        # Use the SELL_PRICE (0.51) as the limit price, not the current market price
+        sell_price = self.SELL_PRICE
 
         return Signal(
             side=side,
             confidence=raw_confidence,
             edge=edge,
-            price=target_price,
-            size=round(size, 2),
+            price=sell_price,
+            size=round(size_usd, 2),
             reason=(
+                f"SELL {'Up' if side == Side.SELL_UP else 'Down'} @ ${sell_price} | "
                 f"BTC {'UP' if binance_delta > 0 else 'DOWN'} "
                 f"{move_magnitude:.1f}bps | "
-                f"prob={true_prob:.1%} vs mkt={market_prob:.1%} | "
-                f"edge={edge:.1%} | "
+                f"conf={raw_confidence:.1%} edge={edge:.1%} | "
                 f"feeds={'AGREE' if feeds_agree else 'DISAGREE'} | "
-                f"t={seconds_into_interval}s"
+                f"t={seconds_into_interval}s/{interval_duration}s"
             ),
         )
 
