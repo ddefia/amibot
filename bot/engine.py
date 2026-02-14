@@ -68,7 +68,12 @@ class BotEngine:
         self._tick_count = 0
         self._last_fill_check: float = 0
         self._last_signal_ts: float = 0  # Rate limit signals
+        self._last_trade_ts: float = 0   # Stagger: min 120s between positions
         self._last_market_refresh: float = 0  # Refresh market prices
+
+        # Position staggering: prevent dumping all positions at once
+        # Data showed 0/6 loss intervals where all 3 positions fired within 16s
+        self.MIN_TRADE_SPACING = 120  # seconds between positions in same interval
 
     async def run(self):
         """Main entry point — start the bot."""
@@ -145,6 +150,7 @@ class BotEngine:
             self.interval_start_ts = current_interval
             self.positions_this_interval = 0
             self.total_active_usd = 0
+            self._last_trade_ts = 0  # Reset stagger timer for new interval
 
             # Reset per-interval bankroll tracking
             self.risk.reset_interval_deployed()
@@ -307,6 +313,7 @@ class BotEngine:
             self.risk.record_trade(signal)
             self.positions_this_interval += 1
             self.total_active_usd += signal.size
+            self._last_trade_ts = time.time()
 
             logger.info(
                 "Position #%d opened | %s | $%.0f | total active: $%.0f | balance remaining: $%.0f",

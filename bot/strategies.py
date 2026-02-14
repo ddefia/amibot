@@ -114,6 +114,12 @@ class LatencyArbStrategy:
     # Buy/sell ratio alignment: if buyers dominate during an up-move, extra confirmation
     VOLUME_DIRECTION_BOOST = 0.03  # +3% confidence when volume direction agrees
 
+    # Time-based edge scaling: early trades need higher edge (reversal risk)
+    # Data: 2-5 min trades at 3-5% edge had 43% WR (net loser)
+    #        5-10 min trades at 8%+ edge had 92% WR
+    EARLY_PHASE_END = 300       # First 5 min = "early" (high reversal risk)
+    EARLY_EDGE_MULTIPLIER = 1.5 # 50% higher edge required in early phase
+
     # Cross-trader lesson: scale position size with confidence (r=0.14 correlation)
     # Higher confidence → bigger position (like winners across all traders)
     MIN_CONFIDENCE_SIZE_SCALE = 0.6   # At minimum confidence, use 60% of position_usd
@@ -268,8 +274,11 @@ class LatencyArbStrategy:
         if is_5min:
             effective_min_edge *= self.FIVE_MIN_EDGE_MULTIPLIER
             effective_min_confidence += self.FIVE_MIN_CONFIDENCE_BOOST
-            logger.debug("5-min penalty: edge threshold %.3f, confidence threshold %.3f",
-                         effective_min_edge, effective_min_confidence)
+
+        # EARLY-PHASE PENALTY: 2-5 min window had 45% WR (net loser).
+        # BTC often fakes out early then reverses. Require higher edge.
+        if seconds_into_interval < self.EARLY_PHASE_END:
+            effective_min_edge *= self.EARLY_EDGE_MULTIPLIER
 
         # EDGE GATE
         if edge < effective_min_edge:
