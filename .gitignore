@@ -11,3 +11,5 @@ build/
 .mypy_cache/
 .pytest_cache/
 data/raw/
+backtest_results_*.json
+btc_1m_*.json
