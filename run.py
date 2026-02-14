@@ -67,7 +67,11 @@ def main():
     print("=" * 60)
 
     if config.dry_run:
-        print("  DRY RUN — no real orders will be placed")
+        print("  PAPER TRADING — real data, simulated orders")
+        print(f"  Paper Balance: ${config.paper_balance:,.0f}")
+        print(f"  Fill Delay: {config.paper_fill_delay_min:.1f}-{config.paper_fill_delay_max:.1f}s")
+        print(f"  Fill Rate: {config.paper_fill_rate:.0%} (liquidity sim)")
+        print("  Orders: open → fill/expire (real lifecycle)")
         print("  Set DRY_RUN=false in .env for live trading")
         print("=" * 60)
 

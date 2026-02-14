@@ -3,17 +3,18 @@
 Handles order placement, fill verification, cancellation, and state sync.
 Fixed from audit: correct size calculation for both BUY and SELL,
 fill verification polling, persistent order state.
+
+Paper trading mode: realistic fill simulation using live market prices.
+Orders go open → filled/expired just like real CLOB, with paper balance
+tracking that deducts collateral and settles P&L on resolution.
 """
 
 import json
+import random
 import time
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
 
 from bot.strategies import Signal, Side
 
@@ -44,10 +45,19 @@ class TrackedOrder:
     filled_shares: float = 0.0
     confidence: float = 0.0
     edge: float = 0.0
+    # Paper trading: random fill delay assigned at placement
+    _paper_fill_after: float = 0.0
 
 
 class Executor:
-    """Handles order placement, fill tracking, and position management."""
+    """Handles order placement, fill tracking, and position management.
+
+    In paper trading mode (dry_run=True), simulates the full order lifecycle:
+    - Orders start as "open" (not instant fill)
+    - check_fills() evaluates real market prices to decide if orders fill
+    - Paper balance tracks collateral lockup and P&L
+    - Fills have realistic random delays and liquidity simulation
+    """
 
     def __init__(self, config):
         self.config = config
@@ -55,6 +65,7 @@ class Executor:
         self.trade_log_file = config.trade_log_file
 
         if not self.dry_run:
+            from py_clob_client.client import ClobClient
             self.client = ClobClient(
                 host=config.clob_host,
                 key=config.private_key,
@@ -63,7 +74,16 @@ class Executor:
             self._init_credentials()
         else:
             self.client = None
-            logger.info("DRY RUN mode — no orders will be placed")
+            # Paper trading state
+            self._paper_balance = config.paper_balance
+            self._paper_collateral_locked = 0.0  # USDC locked in open positions
+            self._paper_realized_pnl = 0.0
+            self._paper_market_prices: dict[str, float] = {}  # token_id → price
+            logger.info(
+                "PAPER TRADING mode — starting balance: $%,.0f | "
+                "fills simulated from real market prices",
+                self._paper_balance,
+            )
 
         self.tracked_orders: dict[str, TrackedOrder] = {}
 
@@ -81,6 +101,20 @@ class Executor:
             creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
             logger.info("API credentials derived from private key")
+
+    # ---- Market state for paper trading ----
+
+    def update_market_prices(self, token_prices: dict[str, float]):
+        """Update current market prices for paper fill simulation.
+
+        Called by the engine every tick with real Polymarket prices.
+        Args:
+            token_prices: {token_id: current_price} for active tokens
+        """
+        if self.dry_run:
+            self._paper_market_prices.update(token_prices)
+
+    # ---- Order placement ----
 
     def place_order(
         self,
@@ -108,8 +142,6 @@ class Executor:
         if shares < 1:
             return OrderResult(False, None, "too_small", error=f"Shares {shares} < 1")
 
-        order_side = SELL if is_sell else BUY
-
         # Log the order details
         side_label = signal.side.value
         logger.info(
@@ -125,32 +157,106 @@ class Executor:
         )
 
         if self.dry_run:
-            fake_id = f"DRY_{int(time.time())}_{side_label}"
-            self._log_trade("place", {
-                "order_id": fake_id,
-                "side": side_label,
-                "price": signal.price,
-                "shares": shares,
-                "usd": signal.size,
-                "is_sell": is_sell,
-                "dry_run": True,
-            })
-            tracked = TrackedOrder(
-                order_id=fake_id,
-                token_id=token_id,
-                side=side_label,
-                price=signal.price,
-                size_shares=shares,
-                size_usd=signal.size,
-                is_sell=is_sell,
-                placed_at=time.time(),
-                status="filled",  # Assume fill in dry run
-                filled_shares=shares,
-                confidence=signal.confidence,
-                edge=signal.edge,
+            return self._paper_place_order(
+                signal, token_id, shares, side_label, is_sell,
             )
-            self.tracked_orders[fake_id] = tracked
-            return OrderResult(True, fake_id, "filled_dry", filled_size=shares)
+
+        return self._live_place_order(
+            signal, token_id, shares, side_label, is_sell,
+        )
+
+    def _paper_place_order(
+        self,
+        signal: Signal,
+        token_id: str,
+        shares: float,
+        side_label: str,
+        is_sell: bool,
+    ) -> OrderResult:
+        """Paper trading: place order as 'open', lock collateral, assign fill delay."""
+        # Calculate collateral required
+        if is_sell:
+            # Selling at price P: collateral = (1-P) * shares (risk if resolves against you)
+            collateral = (1.0 - signal.price) * shares
+        else:
+            # Buying at price P: cost = P * shares
+            collateral = signal.price * shares
+
+        # Check paper balance
+        available = self._paper_balance - self._paper_collateral_locked
+        if collateral > available:
+            logger.warning(
+                "PAPER: Insufficient balance — need $%.0f collateral, have $%.0f available "
+                "(balance=$%.0f, locked=$%.0f)",
+                collateral, available, self._paper_balance, self._paper_collateral_locked,
+            )
+            return OrderResult(
+                False, None, "insufficient_paper_balance",
+                error=f"Need ${collateral:.0f}, have ${available:.0f} available",
+            )
+
+        # Lock collateral
+        self._paper_collateral_locked += collateral
+
+        # Assign random fill delay (simulates order book matching latency)
+        fill_delay = random.uniform(
+            self.config.paper_fill_delay_min,
+            self.config.paper_fill_delay_max,
+        )
+
+        fake_id = f"PAPER_{int(time.time() * 1000)}_{side_label}"
+        tracked = TrackedOrder(
+            order_id=fake_id,
+            token_id=token_id,
+            side=side_label,
+            price=signal.price,
+            size_shares=shares,
+            size_usd=signal.size,
+            is_sell=is_sell,
+            placed_at=time.time(),
+            status="open",  # NOT instant fill — goes through lifecycle
+            filled_shares=0.0,
+            confidence=signal.confidence,
+            edge=signal.edge,
+            _paper_fill_after=time.time() + fill_delay,
+        )
+        self.tracked_orders[fake_id] = tracked
+
+        self._log_trade("place", {
+            "order_id": fake_id,
+            "side": side_label,
+            "price": signal.price,
+            "shares": shares,
+            "usd": signal.size,
+            "collateral_locked": round(collateral, 2),
+            "is_sell": is_sell,
+            "paper": True,
+            "fill_delay": round(fill_delay, 2),
+            "paper_balance": round(self._paper_balance, 2),
+            "paper_available": round(available - collateral, 2),
+        })
+
+        logger.info(
+            "PAPER order OPEN: %s | $%.0f collateral locked | "
+            "available: $%.0f → $%.0f | fill eligible in %.1fs",
+            fake_id, collateral, available, available - collateral, fill_delay,
+        )
+
+        return OrderResult(True, fake_id, "open", filled_size=0.0)
+
+    def _live_place_order(
+        self,
+        signal: Signal,
+        token_id: str,
+        shares: float,
+        side_label: str,
+        is_sell: bool,
+    ) -> OrderResult:
+        """Live trading: place real order on Polymarket CLOB."""
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        order_side = SELL if is_sell else BUY
 
         try:
             order_args = OrderArgs(
@@ -211,9 +317,115 @@ class Executor:
             logger.exception("Order placement failed")
             return OrderResult(False, None, "error", error=str(e))
 
+    # ---- Fill checking ----
+
     def check_fills(self) -> list[TrackedOrder]:
         """Check for filled orders. Returns list of newly filled orders."""
-        if self.dry_run or not self.client:
+        if self.dry_run:
+            return self._paper_check_fills()
+        return self._live_check_fills()
+
+    def _paper_check_fills(self) -> list[TrackedOrder]:
+        """Paper trading fill simulation using real market prices.
+
+        Simulates realistic CLOB behavior:
+        - SELL at 0.51: fills when market price >= 0.51 (someone buys at our price)
+        - BUY at 0.49: fills when market price <= 0.49 (someone sells at our price)
+        - Random fill rate simulates liquidity (not every marketable order fills)
+        - Minimum delay before fill (simulates order book propagation)
+        """
+        now = time.time()
+        newly_filled = []
+        open_orders = [o for o in self.tracked_orders.values() if o.status == "open"]
+
+        if not open_orders:
+            return []
+
+        for order in open_orders:
+            # Not yet eligible (fill delay not elapsed)
+            if now < order._paper_fill_after:
+                continue
+
+            # Check timeout
+            age = now - order.placed_at
+            if age > self.config.order_timeout_seconds:
+                self._paper_release_collateral(order)
+                order.status = "expired"
+                logger.info(
+                    "PAPER order EXPIRED: %s (%.0fs old, no fill)",
+                    order.order_id, age,
+                )
+                self._log_trade("expire", {
+                    "order_id": order.order_id,
+                    "side": order.side,
+                    "age_seconds": round(age, 1),
+                    "paper": True,
+                })
+                continue
+
+            # Get current market price for this token
+            market_price = self._paper_market_prices.get(order.token_id)
+            if market_price is None:
+                # No market price available — can't simulate fill
+                continue
+
+            # Would this order fill at the current market price?
+            would_fill = False
+            if order.is_sell:
+                # SELL limit at order.price: fills when market bid >= our ask
+                # Market price represents what buyers pay, so fill if >= our price
+                would_fill = market_price >= order.price
+            else:
+                # BUY limit at order.price: fills when market ask <= our bid
+                would_fill = market_price <= order.price
+
+            if not would_fill:
+                continue
+
+            # Liquidity simulation: not every marketable order fills instantly
+            if random.random() > self.config.paper_fill_rate:
+                # Didn't fill this check — push eligibility forward slightly
+                order._paper_fill_after = now + random.uniform(0.5, 2.0)
+                logger.debug(
+                    "PAPER: %s marketable but no fill (liquidity sim), retry in ~1s",
+                    order.order_id,
+                )
+                continue
+
+            # FILL the order
+            order.status = "filled"
+            order.filled_shares = order.size_shares
+            newly_filled.append(order)
+
+            fill_latency = now - order.placed_at
+            logger.info(
+                "PAPER order FILLED: %s | %s %.1f shares @ $%.2f | "
+                "market=$%.2f | latency=%.1fs | balance=$%,.0f",
+                order.order_id,
+                "SELL" if order.is_sell else "BUY",
+                order.filled_shares,
+                order.price,
+                market_price,
+                fill_latency,
+                self._paper_balance,
+            )
+
+            self._log_trade("fill", {
+                "order_id": order.order_id,
+                "side": order.side,
+                "price": order.price,
+                "shares": order.filled_shares,
+                "market_price_at_fill": market_price,
+                "fill_latency_s": round(fill_latency, 2),
+                "paper": True,
+                "paper_balance": round(self._paper_balance, 2),
+            })
+
+        return newly_filled
+
+    def _live_check_fills(self) -> list[TrackedOrder]:
+        """Live CLOB fill check."""
+        if not self.client:
             return []
 
         newly_filled = []
@@ -261,9 +473,87 @@ class Executor:
 
         return newly_filled
 
+    # ---- Paper balance management ----
+
+    def _paper_release_collateral(self, order: TrackedOrder):
+        """Release locked collateral for a cancelled/expired paper order."""
+        if order.is_sell:
+            collateral = (1.0 - order.price) * order.size_shares
+        else:
+            collateral = order.price * order.size_shares
+        self._paper_collateral_locked = max(0, self._paper_collateral_locked - collateral)
+
+    def paper_settle_resolution(self, order_id: str, won: bool):
+        """Settle a paper position after market resolution.
+
+        Called by the engine when an interval resolves.
+        Updates paper balance based on win/loss.
+        """
+        if not self.dry_run:
+            return
+
+        order = self.tracked_orders.get(order_id)
+        if not order or order.status != "filled":
+            return
+
+        shares = order.filled_shares
+
+        if order.is_sell:
+            collateral = (1.0 - order.price) * shares
+            if won:
+                # Sold a contract that resolved to $0 — keep the sale proceeds
+                pnl = order.price * shares
+                self._paper_balance += collateral + pnl  # Return collateral + profit
+            else:
+                # Contract resolved to $1 — lose the collateral
+                pnl = -collateral
+                # Collateral already deducted, nothing returned
+        else:
+            cost = order.price * shares
+            if won:
+                # Bought a contract that resolved to $1 — receive $1 per share
+                pnl = (1.0 - order.price) * shares
+                self._paper_balance += cost + pnl  # Return cost + profit
+            else:
+                # Contract resolved to $0 — lose the cost
+                pnl = -cost
+                # Cost already deducted, nothing returned
+
+        self._paper_collateral_locked = max(0, self._paper_collateral_locked - abs(
+            (1.0 - order.price) * shares if order.is_sell else order.price * shares
+        ))
+        self._paper_realized_pnl += pnl
+
+        logger.info(
+            "PAPER SETTLED: %s | %s | P&L=$%+.2f | "
+            "balance=$%,.0f | total P&L=$%+.0f",
+            order.order_id,
+            "WIN" if won else "LOSS",
+            pnl,
+            self._paper_balance,
+            self._paper_realized_pnl,
+        )
+
+        self._log_trade("settle", {
+            "order_id": order.order_id,
+            "side": order.side,
+            "won": won,
+            "pnl": round(pnl, 2),
+            "paper_balance": round(self._paper_balance, 2),
+            "paper_total_pnl": round(self._paper_realized_pnl, 2),
+            "paper": True,
+        })
+
+    # ---- Cancel ----
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""
         if self.dry_run:
+            order = self.tracked_orders.get(order_id)
+            if order and order.status == "open":
+                self._paper_release_collateral(order)
+                order.status = "cancelled"
+                logger.info("PAPER order CANCELLED: %s", order_id)
             self.tracked_orders.pop(order_id, None)
             return True
 
@@ -280,9 +570,14 @@ class Executor:
     def cancel_all(self) -> bool:
         """Cancel all open orders."""
         if self.dry_run:
+            cancelled = 0
             for o in self.tracked_orders.values():
                 if o.status == "open":
+                    self._paper_release_collateral(o)
                     o.status = "cancelled"
+                    cancelled += 1
+            if cancelled:
+                logger.info("PAPER: Cancelled %d open orders", cancelled)
             return True
 
         try:
@@ -296,11 +591,20 @@ class Executor:
             logger.exception("Failed to cancel all orders")
             return False
 
+    # ---- Balance ----
+
     def get_balance(self) -> float | None:
         """Get available USDC balance."""
         if self.dry_run:
-            logger.info("DRY RUN — simulated balance: $50,000")
-            return 50000.0
+            available = self._paper_balance - self._paper_collateral_locked
+            logger.info(
+                "PAPER balance: $%,.0f (locked: $%,.0f, available: $%,.0f, P&L: $%+,.0f)",
+                self._paper_balance,
+                self._paper_collateral_locked,
+                available,
+                self._paper_realized_pnl,
+            )
+            return available
 
         try:
             result = self.client.get_balance_allowance(asset_type="COLLATERAL")
@@ -308,6 +612,8 @@ class Executor:
         except Exception:
             logger.exception("Failed to get balance")
             return None
+
+    # ---- Utilities ----
 
     def get_open_order_ids(self) -> list[str]:
         """Get IDs of currently open (unfilled) tracked orders."""

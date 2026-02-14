@@ -212,6 +212,16 @@ class BotEngine:
         if not up_token.get("price") or not down_token.get("price"):
             return
 
+        # Feed live market prices to executor for paper fill simulation
+        if self.config.dry_run:
+            token_prices = {}
+            if up_token.get("token_id") and up_token.get("price"):
+                token_prices[up_token["token_id"]] = up_token["price"]
+            if down_token.get("token_id") and down_token.get("price"):
+                token_prices[down_token["token_id"]] = down_token["price"]
+            if token_prices:
+                self.executor.update_market_prices(token_prices)
+
         # ---- EVALUATE STRATEGY (with volume confirmation) ----
         volume_stats = self.price_feed.get_volume_stats()
         signal = self.latency_arb.evaluate(
@@ -348,6 +358,17 @@ class BotEngine:
 
             self.risk.record_resolution(i, won)
             resolved_count += 1
+
+            # Settle paper balance for this trade
+            if self.config.dry_run:
+                # Find the matching paper order by side+price+size
+                for oid, order in self.executor.tracked_orders.items():
+                    if (order.status == "filled"
+                            and order.side == trade.side
+                            and abs(order.price - trade.price) < 0.001
+                            and abs(order.size_usd - trade.size) < 1):
+                        self.executor.paper_settle_resolution(oid, won)
+                        break
 
             self._log_event("resolution", {
                 "side": trade.side,

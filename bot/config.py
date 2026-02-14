@@ -87,6 +87,18 @@ class Config:
 
     # Operating mode
     dry_run: bool = field(default_factory=lambda: _env_bool("DRY_RUN", "false"))
+    paper_balance: float = field(default_factory=lambda: _env_float("PAPER_BALANCE", "50000"))
+
+    # Paper trading — realistic fill simulation
+    paper_fill_delay_min: float = field(
+        default_factory=lambda: _env_float("PAPER_FILL_DELAY_MIN", "0.5")
+    )  # Minimum seconds before a paper order can fill
+    paper_fill_delay_max: float = field(
+        default_factory=lambda: _env_float("PAPER_FILL_DELAY_MAX", "5.0")
+    )  # Maximum seconds before a paper order fills (if price is right)
+    paper_fill_rate: float = field(
+        default_factory=lambda: _env_float("PAPER_FILL_RATE", "0.85")
+    )  # Probability that a marketable order fills (simulates liquidity)
 
     # WebSocket endpoints
     clob_ws: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
