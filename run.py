@@ -1,4 +1,9 @@
-"""Entry point for the Polymarket BTC 5-min trading bot."""
+"""Entry point for the Polymarket BTC trading bot.
+
+Usage:
+    python run.py              # Live trading (requires PRIVATE_KEY in .env)
+    DRY_RUN=true python run.py # Paper trading (no real orders)
+"""
 
 import asyncio
 import logging
@@ -25,12 +30,16 @@ def setup_logging(config: Config):
 
 def main():
     config = Config()
-    setup_logging(config)
 
-    if not config.private_key:
-        print("ERROR: PRIVATE_KEY not set in .env file")
-        print("Copy .env.example to .env and add your Polygon wallet private key")
+    # Validate configuration
+    errors = config.validate()
+    if errors:
+        print("Configuration errors:")
+        for e in errors:
+            print(f"  - {e}")
         sys.exit(1)
+
+    setup_logging(config)
 
     engine = BotEngine(config)
 
@@ -43,14 +52,24 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    mode = "DRY RUN" if config.dry_run else "LIVE"
     print("=" * 60)
-    print("  Polymarket BTC 5-Min Trading Bot")
-    print(f"  Strategy: {config.strategy}")
-    print(f"  Max Position: {config.max_position_size} shares")
-    print(f"  Max Exposure: ${config.max_exposure_usdc} USDC")
-    print(f"  Min Edge: {config.min_edge_threshold * 100}%")
-    print(f"  Maker Only: {config.maker_only}")
+    print(f"  Polymarket BTC Latency Arb Bot [{mode}]")
+    print(f"  Strategy: Guy 1 SELL-side ({config.strategy})")
+    print(f"  Position Size: ${config.position_usd:,.0f}")
+    print(f"  Max Exposure: ${config.max_exposure_usdc:,.0f}")
+    print(f"  Min Edge: {config.min_edge_threshold:.1%}")
+    print(f"  Confidence: {config.confidence_threshold:.1%}")
+    print(f"  Prefer 15-min: {config.prefer_15min}")
+    print(f"  Max Positions/Interval: {config.max_positions_per_interval}")
+    print(f"  Daily Loss Limit: ${config.daily_loss_limit_usdc:,.0f}")
+    print(f"  Trade Log: {config.trade_log_file}")
     print("=" * 60)
+
+    if config.dry_run:
+        print("  DRY RUN — no real orders will be placed")
+        print("  Set DRY_RUN=false in .env for live trading")
+        print("=" * 60)
 
     asyncio.run(engine.run())
 
