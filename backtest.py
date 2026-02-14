@@ -242,6 +242,7 @@ class SimulatedTick:
     chainlink_price: float    # "Slow" feed — lagged oracle price
     market_up_price: float    # Polymarket Up/Yes contract price
     market_down_price: float  # Polymarket Down/No contract price
+    volume_stats: dict = field(default_factory=dict)  # Simulated volume data
 
 
 @dataclass
@@ -315,6 +316,11 @@ def build_intervals(klines: list[dict], interval_duration_s: int = 900,
         close_price = interval_candles[-1]["close"]
         resolved_up = close_price > open_price
 
+        # Compute rolling volume stats for this interval's candles
+        # Use a 5-candle (5-min) rolling window, matching the live bot's 300s window
+        vol_ema = 0.0
+        vol_alpha = 0.1
+
         # Generate ticks every 30 seconds within the interval
         ticks = []
         for second_offset in range(0, interval_duration_s, 30):
@@ -378,12 +384,52 @@ def build_intervals(klines: list[dict], interval_duration_s: int = 900,
             up_price = round(up_price, 2)
             down_price = round(down_price, 2)
 
+            # Simulate volume stats from candle data
+            # Rolling 5-candle window (5 min), matching live bot's 300s window
+            window_start = max(0, candle_idx - 4)
+            window_candles = interval_candles[window_start:candle_idx + 1]
+            total_vol_btc = sum(c["volume"] for c in window_candles)
+            total_vol_usd = sum(c["volume"] * (c["open"] + c["close"]) / 2 for c in window_candles)
+
+            # Estimate buy/sell ratio from candle direction
+            buy_vol = 0.0
+            sell_vol = 0.0
+            for c in window_candles:
+                c_vol = c["volume"] * (c["open"] + c["close"]) / 2
+                if c["close"] >= c["open"]:
+                    buy_vol += c_vol * 0.6  # Up candle = ~60% buy
+                    sell_vol += c_vol * 0.4
+                else:
+                    buy_vol += c_vol * 0.4  # Down candle = ~60% sell
+                    sell_vol += c_vol * 0.6
+
+            # Update volume EMA
+            if vol_ema > 0 and total_vol_usd > 0:
+                vol_ema = vol_alpha * total_vol_usd + (1 - vol_alpha) * vol_ema
+            elif total_vol_usd > 0:
+                vol_ema = total_vol_usd
+
+            vol_ratio = total_vol_usd / vol_ema if vol_ema > 0 else 1.0
+            buy_ratio = buy_vol / total_vol_usd if total_vol_usd > 0 else 0.5
+
+            volume_stats = {
+                "total_usd": total_vol_usd,
+                "buy_usd": buy_vol,
+                "sell_usd": sell_vol,
+                "buy_ratio": buy_ratio,
+                "trade_count": len(window_candles) * 100,  # ~100 trades per candle
+                "avg_trade_usd": total_vol_usd / (len(window_candles) * 100) if window_candles else 0,
+                "volume_ratio": vol_ratio,
+                "volume_ema": vol_ema,
+            }
+
             ticks.append(SimulatedTick(
                 timestamp_s=tick_ts,
                 binance_price=binance_price,
                 chainlink_price=chainlink_price,
                 market_up_price=up_price,
                 market_down_price=down_price,
+                volume_stats=volume_stats,
             ))
 
         interval = Interval(
@@ -457,6 +503,12 @@ class BacktestResult:
     equity_curve: list[float] = field(default_factory=list)
     daily_pnl: dict = field(default_factory=dict)
 
+    # Bankroll
+    start_balance: float = 0.0
+    end_balance: float = 0.0
+    cooldown_events: int = 0
+    drawdown_halt_events: int = 0
+
 
 def run_backtest(
     intervals: list[Interval],
@@ -469,10 +521,16 @@ def run_backtest(
     daily_loss_limit: float = 5000,
     start_date: str = "",
     end_date: str = "",
+    bankroll: float = 50000,
+    max_pct_per_trade: float = 0.05,
+    max_pct_per_interval: float = 0.15,
+    max_pct_total_exposure: float = 0.40,
+    drawdown_halt_pct: float = 0.20,
 ) -> BacktestResult:
-    """Run the backtest using the exact same strategy logic as the live bot.
+    """Run the backtest using the exact same strategy + risk logic as the live bot.
 
-    This imports and uses LatencyArbStrategy directly.
+    This imports and uses LatencyArbStrategy directly, plus simulates
+    bankroll protection (% limits, loss streak decay, drawdown halt).
     """
     from bot.strategies import LatencyArbStrategy, MispricingStrategy, Side
 
@@ -493,17 +551,37 @@ def run_backtest(
     daily_pnl_map: dict[str, float] = {}
     daily_loss_tracker: dict[str, float] = {}
 
+    # Bankroll tracking
+    current_balance = bankroll
+    start_balance = bankroll
+    total_exposure = 0.0
+    consecutive_losses = 0
+    cooldown_until = 0  # Unix timestamp
+    drawdown_halted = False
+    cooldown_events = 0
+    drawdown_halt_events = 0
+
     total_ticks = 0
 
     for interval in intervals:
         # Track exposure within this interval
         interval_positions: list[BacktestPosition] = []
         interval_exposure = 0.0
+        interval_deployed = 0.0
 
         # Check daily loss limit
         day_key = datetime.fromtimestamp(interval.start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         if daily_loss_tracker.get(day_key, 0) <= -daily_loss_limit:
             continue  # Skip this interval — daily loss limit hit
+
+        # Drawdown circuit breaker
+        if drawdown_halted:
+            # Auto-resume if recovered past half the threshold
+            drawdown_pct = (start_balance - current_balance) / start_balance if start_balance > 0 else 0
+            if drawdown_pct < drawdown_halt_pct * 0.5:
+                drawdown_halted = False
+            else:
+                continue
 
         for tick in interval.ticks:
             total_ticks += 1
@@ -513,7 +591,11 @@ def run_backtest(
             if len(interval_positions) >= max_positions_per_interval:
                 continue
 
-            # Run the strategy
+            # Cooldown after loss streak
+            if tick.timestamp_s < cooldown_until:
+                continue
+
+            # Run the strategy (with volume stats)
             signal = strategy.evaluate(
                 interval_start_price=interval.open_price,
                 current_binance_price=tick.binance_price,
@@ -523,6 +605,7 @@ def run_backtest(
                 seconds_into_interval=seconds_into_interval,
                 interval_duration=interval.duration_s,
                 current_exposure_usd=interval_exposure,
+                volume_stats=tick.volume_stats if tick.volume_stats else None,
             )
 
             # Fallback: mispricing check
@@ -537,8 +620,73 @@ def run_backtest(
             if signal.side == Side.NONE:
                 continue
 
-            # Open position
+            # --- BANKROLL RISK CHECKS ---
             is_sell = signal.side in (Side.SELL_UP, Side.SELL_DOWN)
+            if is_sell:
+                shares = signal.size / signal.price if signal.price > 0 else 0
+                trade_risk = (1.0 - signal.price) * shares
+            else:
+                trade_risk = signal.size
+
+            # Consecutive loss streak → cooldown
+            if consecutive_losses >= 5:
+                cooldown_until = tick.timestamp_s + 300
+                consecutive_losses = 0
+                cooldown_events += 1
+                continue
+
+            # Absolute exposure limit
+            if total_exposure + trade_risk > max_active_exposure:
+                continue
+
+            # Bankroll % limits
+            if current_balance > 0:
+                # Max 5% per trade
+                if trade_risk > current_balance * max_pct_per_trade:
+                    # Reduce size to fit
+                    signal = type(signal)(
+                        side=signal.side,
+                        confidence=signal.confidence,
+                        edge=signal.edge,
+                        price=signal.price,
+                        size=round(current_balance * max_pct_per_trade, 2),
+                        reason=signal.reason,
+                    )
+                    if is_sell:
+                        shares = signal.size / signal.price if signal.price > 0 else 0
+                        trade_risk = (1.0 - signal.price) * shares
+                    else:
+                        trade_risk = signal.size
+
+                # Max 15% per interval
+                if interval_deployed + signal.size > current_balance * max_pct_per_interval:
+                    continue
+
+                # Max 40% total exposure
+                if total_exposure + trade_risk > current_balance * max_pct_total_exposure:
+                    continue
+
+            # Loss streak decay (0.8^n)
+            if consecutive_losses > 0:
+                reduction = 0.8 ** consecutive_losses
+                adjusted_size = round(signal.size * reduction, 2)
+                if adjusted_size < 50:
+                    continue
+                signal = type(signal)(
+                    side=signal.side,
+                    confidence=signal.confidence,
+                    edge=signal.edge,
+                    price=signal.price,
+                    size=adjusted_size,
+                    reason=signal.reason,
+                )
+                if is_sell:
+                    shares = signal.size / signal.price if signal.price > 0 else 0
+                    trade_risk = (1.0 - signal.price) * shares
+                else:
+                    trade_risk = signal.size
+
+            # Open position
             pos = BacktestPosition(
                 interval_start=interval.start_ts,
                 side=signal.side.value,
@@ -550,13 +698,9 @@ def run_backtest(
                 is_sell=is_sell,
             )
             interval_positions.append(pos)
-
-            # Track exposure correctly for sell vs buy
-            if is_sell:
-                shares = signal.size / signal.price if signal.price > 0 else 0
-                interval_exposure += (1.0 - signal.price) * shares
-            else:
-                interval_exposure += signal.price * signal.size
+            interval_exposure += trade_risk
+            interval_deployed += signal.size
+            total_exposure += trade_risk
 
         # Resolve all positions at interval end
         for pos in interval_positions:
@@ -565,6 +709,7 @@ def run_backtest(
             if pos.is_sell:
                 # SELL-side resolution
                 shares = pos.size_usd / pos.price if pos.price > 0 else 0
+                risk_amount = (1.0 - pos.price) * shares
 
                 if pos.side == "sell_down":
                     # Sold Down contracts — win if BTC went UP (Down -> $0)
@@ -575,8 +720,12 @@ def run_backtest(
 
                 if pos.won:
                     pos.pnl = pos.price * shares  # Keep sell proceeds
+                    consecutive_losses = 0
                 else:
-                    pos.pnl = -(1.0 - pos.price) * shares  # Pay remainder
+                    pos.pnl = -risk_amount  # Pay remainder
+                    consecutive_losses += 1
+
+                total_exposure = max(0, total_exposure - risk_amount)
             else:
                 # BUY-side resolution
                 if pos.side == "buy_up":
@@ -586,11 +735,23 @@ def run_backtest(
 
                 if pos.won:
                     pos.pnl = (1.0 - pos.price) * pos.size_usd
+                    consecutive_losses = 0
                 else:
                     pos.pnl = -pos.price * pos.size_usd
+                    consecutive_losses += 1
+
+                total_exposure = max(0, total_exposure - pos.size_usd)
 
             running_pnl += pos.pnl
+            current_balance += pos.pnl
             equity_curve.append(running_pnl)
+
+            # Drawdown circuit breaker check
+            if start_balance > 0:
+                dd_pct = (start_balance - current_balance) / start_balance
+                if dd_pct >= drawdown_halt_pct and not drawdown_halted:
+                    drawdown_halted = True
+                    drawdown_halt_events += 1
 
             # Track peak and drawdown
             if running_pnl > peak_equity:
@@ -618,6 +779,10 @@ def run_backtest(
         positions=positions,
         equity_curve=equity_curve,
         daily_pnl=daily_pnl_map,
+        start_balance=start_balance,
+        end_balance=current_balance,
+        cooldown_events=cooldown_events,
+        drawdown_halt_events=drawdown_halt_events,
     )
 
     if positions:
@@ -698,6 +863,15 @@ def print_report(result: BacktestResult):
     if result.total_trades > 0:
         win_loss_ratio = abs(result.avg_win / result.avg_loss) if result.avg_loss != 0 else 0
         print(f"  Win/Loss Ratio:    {win_loss_ratio:>10.2f}x")
+
+    if result.start_balance > 0:
+        print(f"\n{'BANKROLL PROTECTION':=^50}")
+        print(f"  Start balance:     ${result.start_balance:>10,.2f}")
+        print(f"  End balance:       ${result.end_balance:>10,.2f}")
+        bankroll_return = (result.end_balance - result.start_balance) / result.start_balance * 100
+        print(f"  Return:            {bankroll_return:>10.1f}%")
+        print(f"  Cooldown events:   {result.cooldown_events:>10}")
+        print(f"  Drawdown halts:    {result.drawdown_halt_events:>10}")
 
     # Daily P&L breakdown
     if result.daily_pnl:
@@ -1029,6 +1203,8 @@ Examples:
                         help="Market efficiency 0.0-1.0 (0=fully lagged, 1=perfectly efficient, default: 0.5)")
     parser.add_argument("--synthetic", action="store_true",
                         help="Use synthetic data (skip Binance API, useful when geo-blocked)")
+    parser.add_argument("--bankroll", type=float, default=50000,
+                        help="Starting bankroll in USD (default: 50000)")
 
     args = parser.parse_args()
 
@@ -1087,6 +1263,7 @@ Examples:
         print(f"  Min edge: {args.min_edge:.1%}")
         print(f"  Confidence: {args.confidence:.1%}")
         print(f"  Max exposure: ${args.max_exposure:,.0f}")
+        print(f"  Bankroll: ${args.bankroll:,.0f}")
 
         result = run_backtest(
             intervals=intervals,
@@ -1097,6 +1274,7 @@ Examples:
             daily_loss_limit=args.daily_loss_limit,
             start_date=start_str,
             end_date=end_str,
+            bankroll=args.bankroll,
         )
 
         print_report(result)
