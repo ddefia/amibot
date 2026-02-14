@@ -63,7 +63,7 @@ class BotEngine:
         self.current_parsed: dict | None = None
         self.interval_start_price: float | None = None
         self.interval_start_ts: int = 0
-        self.interval_duration: int = 3600  # Detected from market
+        self.interval_duration: int = 900  # Detected from market
         self.positions_this_interval: int = 0
         self.total_active_usd: float = 0
 
@@ -129,7 +129,7 @@ class BotEngine:
         self._tick_count += 1
 
         # Detect interval boundaries using actual market data
-        interval_mod = self.interval_duration if self.interval_duration > 0 else 3600
+        interval_mod = self.interval_duration if self.interval_duration > 0 else 900
         current_interval = now - (now % interval_mod)
         seconds_into_interval = now % interval_mod
 
@@ -162,7 +162,7 @@ class BotEngine:
             self.current_market = self.market_finder.get_best_market()
             if self.current_market:
                 self.current_parsed = self.market_finder.parse_market(self.current_market)
-                self.interval_duration = self.current_parsed.get("interval_duration", 3600)
+                self.interval_duration = self.current_parsed.get("interval_duration", 900)
                 interval_min = self.interval_duration // 60
                 logger.info("Market: %s (%d-min)", self.current_parsed["slug"], interval_min)
             else:
@@ -180,10 +180,24 @@ class BotEngine:
             if balance is not None:
                 self.risk.set_balance(balance)
 
+        # ---- LATE PRICE CAPTURE ----
+        # If interval_start_price was missed (feeds not ready at boundary),
+        # capture it now from whatever feed is available
+        if self.interval_start_price is None and self.price_feed.latest_chainlink:
+            self.interval_start_price = self.price_feed.latest_chainlink.price
+            logger.info("Late price capture for interval: $%.2f", self.interval_start_price)
+
         # ---- SKIP CHECKS ----
         if not self.current_market or not self.interval_start_price:
+            if self._tick_count % 10 == 0:
+                logger.debug("Skip: market=%s start_price=%s",
+                             bool(self.current_market), self.interval_start_price)
             return
         if not self.price_feed.latest_binance or not self.price_feed.latest_chainlink:
+            if self._tick_count % 10 == 0:
+                logger.debug("Skip: binance=%s chainlink=%s",
+                             bool(self.price_feed.latest_binance),
+                             bool(self.price_feed.latest_chainlink))
             return
         # Check feed freshness
         if not self.price_feed.is_binance_fresh():
@@ -209,6 +223,9 @@ class BotEngine:
         down_token = parsed["tokens"].get("DOWN", {})
 
         if not up_token.get("price") or not down_token.get("price"):
+            if self._tick_count % 10 == 0:
+                logger.warning("Missing market prices: Up=%s Down=%s",
+                               up_token.get("price"), down_token.get("price"))
             return
 
         # Feed live market prices to executor for paper fill simulation
@@ -247,6 +264,10 @@ class BotEngine:
         self._last_signal_ts = time.time()
 
         if signal.side == Side.NONE:
+            if self._tick_count % 12 == 0:  # Log every ~60s (12 ticks × 5s rate limit)
+                logger.info("No signal: %s | Up=$%.2f Down=$%.2f",
+                            signal.reason[:100],
+                            up_token.get("price", 0), down_token.get("price", 0))
             return
 
         # ---- RISK CHECK ----
@@ -420,8 +441,10 @@ class BotEngine:
                     price = float(data.get("price", 0))
                     if price > 0:
                         token_info["price"] = price
+                else:
+                    logger.debug("CLOB price %s: HTTP %d", label, resp.status_code)
         except Exception as e:
-            logger.debug("CLOB price refresh failed: %s", e)
+            logger.warning("CLOB price refresh failed: %s", e)
 
     async def _on_price_tick(self, tick: PriceTick):
         """Handle incoming price ticks — monitor for feed gaps."""

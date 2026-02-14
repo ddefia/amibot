@@ -71,26 +71,25 @@ class LatencyArbStrategy:
     The key edge: Polymarket market prices lag Binance by seconds.
     By the time the market adjusts, Guy 1 has already sold at stale prices."""
 
-    # Timing window — trades in the second half of intervals
-    # 15-min intervals: trade at 600-780s (10-13 min mark)
-    # 5-min intervals: trade at 180-260s (3-4.3 min mark)
-    # Hourly intervals: trade at 2400-3300s (40-55 min mark)
-    # Daily intervals: no timing gate (always active after first 30 min)
-    ENTRY_WINDOW_15M_START = 600   # 10 min into 15-min interval
-    ENTRY_WINDOW_15M_END = 780     # 13 min into 15-min interval
-    ENTRY_WINDOW_5M_START = 180    # 3 min into 5-min interval
-    ENTRY_WINDOW_5M_END = 260      # 4.3 min into 5-min interval
-    ENTRY_WINDOW_1H_START = 2400   # 40 min into hourly interval
-    ENTRY_WINDOW_1H_END = 3300     # 55 min into hourly interval
-    ENTRY_WINDOW_DAILY_START = 1800  # 30 min in (allow warmup)
-    ENTRY_WINDOW_DAILY_END = 82800   # 23 hours (stop 1h before close)
+    # Timing window — allow trading throughout most of each interval.
+    # Only skip the first ~2 min (to let prices stabilize) and last ~1 min.
+    ENTRY_WINDOW_15M_START = 30    # 30s into 15-min interval (prices settle fast)
+    ENTRY_WINDOW_15M_END = 840     # 14 min (stop 1 min before close)
+    ENTRY_WINDOW_5M_START = 60     # 1 min into 5-min interval
+    ENTRY_WINDOW_5M_END = 270      # 4.5 min
+    ENTRY_WINDOW_1H_START = 120    # 2 min into hourly interval
+    ENTRY_WINDOW_1H_END = 3480     # 58 min
+    ENTRY_WINDOW_DAILY_START = 300   # 5 min in
+    ENTRY_WINDOW_DAILY_END = 82800   # 23 hours
 
     # Guy 1's exact price: 97.6% of fills at $0.51
     SELL_PRICE = 0.51
 
     # Price gate — only sell when contract is in this range
-    MIN_SELL_PRICE = 0.48  # Don't sell below this (too cheap = risky)
-    MAX_SELL_PRICE = 0.55  # Don't sell above this (too expensive = market already moved)
+    # Wider than Guy 1's $0.51 target because REST mode lacks latency edge.
+    # Edge gate (>= 3%) still prevents unprofitable trades at extreme prices.
+    MIN_SELL_PRICE = 0.35  # Below this, edge is negative at typical confidence levels
+    MAX_SELL_PRICE = 0.65  # Above this, market has already moved against us
 
     # Position sizing from Guy 1's data
     DEFAULT_POSITION_USD = 1500    # $1,500 per position (median ~$1,200)
@@ -197,7 +196,9 @@ class LatencyArbStrategy:
 
         # Need at least 3bps movement to have directional conviction
         if move_magnitude < 3:
-            return Signal(Side.NONE, 0, 0, 0, 0, "Move too small (<3bps)")
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Move too small ({move_magnitude:.1f}bps < 3bps) "
+                          f"BTC ${current_binance_price:.0f} vs start ${interval_start_price:.0f}")
 
         # Confidence model — later in interval = higher predictive power
         raw_confidence = min(0.95, 0.50 + (move_magnitude / 80) * time_factor)
@@ -299,8 +300,10 @@ class LatencyArbStrategy:
         if size_usd < 100:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0, "Size too small")
 
-        # Use the SELL_PRICE (0.51) as the limit price, not the current market price
-        sell_price = self.SELL_PRICE
+        # Use the current market price as limit price (fills immediately in paper mode).
+        # Guy 1 uses fixed $0.51 with WS latency edge, but in REST mode we sell
+        # at whatever the market offers within our price gate ($0.48-$0.55).
+        sell_price = target_price
 
         return Signal(
             side=side,

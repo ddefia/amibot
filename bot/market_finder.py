@@ -1,13 +1,13 @@
 """Finds active BTC Up/Down markets on Polymarket via the Gamma API.
 
-These markets don't appear in generic /events or /markets queries.
-They must be fetched by constructing the exact slug for the current
-date/time. Discovered slug patterns:
+These markets use epoch-based slugs that encode the interval start time:
+  15-min: btc-updown-15m-{epoch}    (PREFERRED — cross-trader net +$305K)
+  5-min:  btc-updown-5m-{epoch}
+  4-hour: btc-updown-4h-{epoch}
+  Hourly: bitcoin-up-or-down-{month}-{day}-{hour}{ampm}-et
+  Daily:  bitcoin-up-or-down-on-{month}-{day}
 
-  Daily:  bitcoin-up-or-down-on-february-14
-  Hourly: bitcoin-up-or-down-february-14-3am-et
-
-Priority order: hourly > daily (more trading opportunities, higher edge).
+Priority: 15-min > hourly > daily (per cross-trader performance data).
 """
 
 import json
@@ -22,17 +22,33 @@ logger = logging.getLogger(__name__)
 ET = timezone(timedelta(hours=-5))
 
 
-def _month_name(dt: datetime) -> str:
-    """Return lowercase full month name."""
-    return dt.strftime("%B").lower()
+def _current_15m_epoch() -> int:
+    """Get the Unix epoch for the start of the current 15-min window."""
+    now = int(time.time())
+    return now - (now % 900)
+
+
+def _current_5m_epoch() -> int:
+    """Get the Unix epoch for the start of the current 5-min window."""
+    now = int(time.time())
+    return now - (now % 300)
+
+
+def _build_15m_slug(epoch: int) -> str:
+    """Build slug for a 15-min market. Example: 'btc-updown-15m-1771126200'"""
+    return f"btc-updown-15m-{epoch}"
+
+
+def _build_5m_slug(epoch: int) -> str:
+    """Build slug for a 5-min market. Example: 'btc-updown-5m-1771126200'"""
+    return f"btc-updown-5m-{epoch}"
 
 
 def _build_hourly_slug(dt_et: datetime) -> str:
-    """Build slug for the hourly market at the given ET hour.
-
+    """Build slug for the hourly market.
     Example: 'bitcoin-up-or-down-february-14-3am-et'
     """
-    month = _month_name(dt_et)
+    month = dt_et.strftime("%B").lower()
     day = dt_et.day
     h = dt_et.hour
     ampm = "am" if h < 12 else "pm"
@@ -42,10 +58,9 @@ def _build_hourly_slug(dt_et: datetime) -> str:
 
 def _build_daily_slug(dt_et: datetime) -> str:
     """Build slug for the daily market.
-
     Example: 'bitcoin-up-or-down-on-february-14'
     """
-    month = _month_name(dt_et)
+    month = dt_et.strftime("%B").lower()
     day = dt_et.day
     return f"bitcoin-up-or-down-on-{month}-{day}"
 
@@ -60,10 +75,10 @@ class MarketFinder:
         self._cache: dict | None = None
         self._cache_slug: str = ""
         self._cache_ts: float = 0
-        self._cache_ttl: float = 30  # seconds
+        self._cache_ttl: float = 10  # seconds
 
-    def _fetch_event_by_slug(self, slug: str) -> dict | None:
-        """Fetch a single event by exact slug. Returns the first market or None."""
+    def _fetch_market_by_slug(self, slug: str) -> dict | None:
+        """Fetch a market by slug. Tries /events first, then /markets."""
         try:
             resp = self.client.get(
                 f"{self.gamma_host}/events",
@@ -73,70 +88,89 @@ class MarketFinder:
             events = resp.json()
             if events and events[0].get("markets"):
                 return events[0]["markets"][0]
-        except Exception as e:
-            logger.debug("Slug %s not found: %s", slug, e)
+        except Exception:
+            pass
+
+        # Fallback: try /markets endpoint directly
+        try:
+            resp = self.client.get(
+                f"{self.gamma_host}/markets",
+                params={"slug": slug},
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+            if markets:
+                return markets[0]
+        except Exception:
+            pass
+
         return None
 
     def get_best_market(self) -> dict | None:
         """Get the best active BTC Up/Down market for right now.
 
-        Tries hourly first (current hour, then next hour for early entry),
-        then falls back to the daily market.
+        Priority: 15-min (preferred by strategy) > hourly > daily.
         """
         now_utc = datetime.now(timezone.utc)
         now_et = now_utc.astimezone(ET)
 
+        # Build current 15-min slug
+        epoch_15m = _current_15m_epoch()
+        slug_15m = _build_15m_slug(epoch_15m)
+
         # Check cache
-        hourly_slug = _build_hourly_slug(now_et)
         if (self._cache
-                and self._cache_slug == hourly_slug
+                and self._cache_slug == slug_15m
                 and (time.time() - self._cache_ts) < self._cache_ttl):
             return self._cache
 
-        # Try current hourly market
-        market = self._fetch_event_by_slug(hourly_slug)
-        if market:
-            active = market.get("active", False)
-            closed = market.get("closed", True)
-            if active and not closed:
-                market["_interval_duration"] = 3600
+        # ---- TRY 15-MIN MARKET (preferred) ----
+        if self.prefer_15min:
+            market = self._fetch_market_by_slug(slug_15m)
+            if market and market.get("active") and not market.get("closed"):
+                market["_interval_duration"] = 900
                 self._cache = market
-                self._cache_slug = hourly_slug
+                self._cache_slug = slug_15m
                 self._cache_ts = time.time()
-                logger.info("Found hourly market: %s", market.get("question", ""))
+                logger.info("Found 15-min market: %s", market.get("question", ""))
                 return market
 
-        # Try daily market
+        # ---- TRY HOURLY MARKET ----
+        hourly_slug = _build_hourly_slug(now_et)
+        market = self._fetch_market_by_slug(hourly_slug)
+        if market and market.get("active") and not market.get("closed"):
+            market["_interval_duration"] = 3600
+            self._cache = market
+            self._cache_slug = hourly_slug
+            self._cache_ts = time.time()
+            logger.info("Found hourly market: %s", market.get("question", ""))
+            return market
+
+        # ---- TRY DAILY MARKET ----
         daily_slug = _build_daily_slug(now_et)
-        market = self._fetch_event_by_slug(daily_slug)
-        if market:
-            active = market.get("active", False)
-            closed = market.get("closed", True)
-            if active and not closed:
-                # Daily markets: noon-to-noon ET = 86400s
-                market["_interval_duration"] = 86400
-                self._cache = market
-                self._cache_slug = daily_slug
-                self._cache_ts = time.time()
-                logger.info("Found daily market: %s", market.get("question", ""))
-                return market
+        market = self._fetch_market_by_slug(daily_slug)
+        if market and market.get("active") and not market.get("closed"):
+            market["_interval_duration"] = 86400
+            self._cache = market
+            self._cache_slug = daily_slug
+            self._cache_ts = time.time()
+            logger.info("Found daily market: %s", market.get("question", ""))
+            return market
 
-        # Try tomorrow's daily (in case today's has closed)
+        # ---- TRY TOMORROW DAILY ----
         tomorrow_et = now_et + timedelta(days=1)
         tomorrow_slug = _build_daily_slug(tomorrow_et)
-        market = self._fetch_event_by_slug(tomorrow_slug)
-        if market:
-            active = market.get("active", False)
-            closed = market.get("closed", True)
-            if active and not closed:
-                market["_interval_duration"] = 86400
-                self._cache = market
-                self._cache_slug = tomorrow_slug
-                self._cache_ts = time.time()
-                logger.info("Found tomorrow daily market: %s", market.get("question", ""))
-                return market
+        market = self._fetch_market_by_slug(tomorrow_slug)
+        if market and market.get("active") and not market.get("closed"):
+            market["_interval_duration"] = 86400
+            self._cache = market
+            self._cache_slug = tomorrow_slug
+            self._cache_ts = time.time()
+            logger.info("Found tomorrow daily market: %s", market.get("question", ""))
+            return market
 
-        logger.warning("No active BTC Up/Down market found for %s", now_et.strftime("%b %d %I%p ET"))
+        logger.warning("No active BTC Up/Down market found for %s",
+                        now_et.strftime("%b %d %I:%M%p ET"))
         return None
 
     def get_current_market(self) -> dict | None:
@@ -170,7 +204,7 @@ class MarketFinder:
             "condition_id": market.get("conditionId"),
             "slug": market.get("slug", ""),
             "question": market.get("question", ""),
-            "interval_duration": market.get("_interval_duration", 3600),
+            "interval_duration": market.get("_interval_duration", 900),
             "tokens": {},
         }
 
