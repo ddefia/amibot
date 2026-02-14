@@ -19,7 +19,7 @@ import logging
 from bot.config import Config
 from bot.market_finder import MarketFinder
 from bot.price_feed import PriceFeed, PriceTick
-from bot.strategies import LatencyArbStrategy, MispricingStrategy, Side
+from bot.strategies import LatencyArbStrategy, Side
 from bot.executor import Executor
 from bot.risk import RiskManager
 
@@ -54,10 +54,6 @@ class BotEngine:
             confidence_threshold=config.confidence_threshold,
             position_usd=config.position_usd,
         )
-        self.mispricing = MispricingStrategy(
-            max_position=config.max_position_size,
-        )
-
         # State — current interval
         self.current_market: dict | None = None
         self.current_parsed: dict | None = None
@@ -88,12 +84,19 @@ class BotEngine:
         # Register price tick handler
         self.price_feed.on_tick(self._on_price_tick)
 
-        # Run price feeds, trading loop, and fill checker concurrently
-        await asyncio.gather(
+        # Run price feeds, trading loop, and fill checker concurrently.
+        # return_exceptions=True prevents one task crash from killing all others.
+        results = await asyncio.gather(
             self.price_feed.start(),
             self._trading_loop(),
             self._fill_check_loop(),
+            return_exceptions=True,
         )
+        # Log any task failures
+        task_names = ["price_feed", "trading_loop", "fill_check"]
+        for name, result in zip(task_names, results):
+            if isinstance(result, Exception):
+                logger.error("Task %s crashed: %s", name, result, exc_info=result)
 
     async def _trading_loop(self):
         """Main trading loop — runs every second."""
@@ -251,15 +254,6 @@ class BotEngine:
             current_exposure_usd=self.total_active_usd,
             volume_stats=volume_stats,
         )
-
-        # Fallback: mispricing (pure arb when Up+Down < $1.00)
-        if signal.side == Side.NONE:
-            mispricing_signal = self.mispricing.evaluate(
-                market_up_price=up_token["price"],
-                market_down_price=down_token["price"],
-            )
-            if mispricing_signal.side != Side.NONE:
-                signal = mispricing_signal
 
         self._last_signal_ts = time.time()
 

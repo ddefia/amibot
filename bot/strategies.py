@@ -194,10 +194,11 @@ class LatencyArbStrategy:
         time_factor = seconds_into_interval / interval_duration
         move_magnitude = abs(binance_pct_move) * 10000  # in bps
 
-        # Need at least 3bps movement to have directional conviction
-        if move_magnitude < 3:
+        # Need at least 2bps movement to have directional conviction
+        # (lowered from 3 for REST mode — catch moves before market fully adjusts)
+        if move_magnitude < 2:
             return Signal(Side.NONE, 0, 0, 0, 0,
-                          f"Move too small ({move_magnitude:.1f}bps < 3bps) "
+                          f"Move too small ({move_magnitude:.1f}bps < 2bps) "
                           f"BTC ${current_binance_price:.0f} vs start ${interval_start_price:.0f}")
 
         # Confidence model — later in interval = higher predictive power
