@@ -117,8 +117,10 @@ class LatencyArbStrategy:
     # Time-based edge scaling: early trades need higher edge (reversal risk)
     # Data: 2-5 min trades at 3-5% edge had 43% WR (net loser)
     #        5-10 min trades at 8%+ edge had 92% WR
+    # Paper session: 3 early fakeout losses at t=132-159s with 7.8-9.2% edge.
+    #   2.0x multiplier requires 10% edge early → would have filtered all 3.
     EARLY_PHASE_END = 300       # First 5 min = "early" (high reversal risk)
-    EARLY_EDGE_MULTIPLIER = 1.5 # 50% higher edge required in early phase
+    EARLY_EDGE_MULTIPLIER = 2.0 # 100% higher edge required in early phase
 
     # Cross-trader lesson: scale position size with confidence (r=0.14 correlation)
     # Higher confidence → bigger position (like winners across all traders)
@@ -307,7 +309,7 @@ class LatencyArbStrategy:
         remaining_budget = self.MAX_ACTIVE_EXPOSURE - current_exposure_usd
         size_usd = min(base_size, remaining_budget)
 
-        if size_usd < 100:
+        if size_usd < 3:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0, "Size too small")
 
         # Use the current market price as limit price (fills immediately in paper mode).
