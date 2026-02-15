@@ -420,6 +420,14 @@ class BotEngine:
                 stats["consecutive_losses"],
             )
 
+            # In live mode, refresh real balance after resolutions
+            # (Polymarket auto-settles positions on-chain)
+            if not self.config.dry_run:
+                balance = self.executor.get_balance()
+                if balance is not None:
+                    self.risk.set_balance(balance)
+                    logger.info("Post-resolution live balance: $%.2f USDC", balance)
+
     def _refresh_clob_prices(self):
         """Fetch live Up/Down prices from the CLOB order book API.
 

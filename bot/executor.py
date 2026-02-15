@@ -63,6 +63,8 @@ class Executor:
         self.config = config
         self.dry_run = config.dry_run
         self.trade_log_file = config.trade_log_file
+        self._last_api_call = 0.0
+        self._api_min_interval = 0.2  # 5 calls/sec rate limit
 
         if not self.dry_run:
             from py_clob_client.client import ClobClient
@@ -72,6 +74,7 @@ class Executor:
                 chain_id=config.chain_id,
             )
             self._init_credentials()
+            self._verify_setup()
         else:
             self.client = None
             # Paper trading state
@@ -101,6 +104,68 @@ class Executor:
             creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
             logger.info("API credentials derived from private key")
+
+    def _verify_setup(self):
+        """Verify wallet is ready for live trading: balance, allowance, API access."""
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.client.get_balance_allowance(params)
+            balance = float(result.get("balance", 0))
+            allowance = float(result.get("allowance", 0))
+
+            logger.info("LIVE MODE — Wallet balance: $%.2f USDC", balance)
+            logger.info("LIVE MODE — Wallet allowance: $%.2f USDC", allowance)
+
+            if balance < 10:
+                raise RuntimeError(
+                    f"Insufficient USDC balance: ${balance:.2f}. "
+                    "Need at least $10. Fund your Polygon wallet first."
+                )
+            if allowance < balance:
+                logger.warning(
+                    "Allowance ($%.2f) < balance ($%.2f). "
+                    "Attempting to set allowance...",
+                    allowance, balance,
+                )
+                try:
+                    self.client.set_allowances()
+                    logger.info("Allowance set successfully")
+                except Exception as e:
+                    logger.warning(
+                        "Could not auto-set allowance: %s. "
+                        "You may need to approve via Polymarket UI.", e,
+                    )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error("Failed to verify live wallet setup: %s", e)
+            raise RuntimeError(f"Live setup verification failed: {e}") from e
+
+    def _retry_api(self, fn, max_retries=3, base_delay=1.0):
+        """Retry an API call with exponential backoff and rate limiting."""
+        # Rate limiting
+        now = time.time()
+        elapsed = now - self._last_api_call
+        if elapsed < self._api_min_interval:
+            time.sleep(self._api_min_interval - elapsed)
+        self._last_api_call = time.time()
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "API call failed (attempt %d/%d): %s — retrying in %.1fs",
+                        attempt + 1, max_retries, e, delay,
+                    )
+                    time.sleep(delay)
+        raise last_error
 
     # ---- Market state for paper trading ----
 
@@ -253,7 +318,7 @@ class Executor:
         is_sell: bool,
     ) -> OrderResult:
         """Live trading: place real order on Polymarket CLOB."""
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
         from py_clob_client.order_builder.constants import BUY, SELL
 
         order_side = SELL if is_sell else BUY
@@ -266,7 +331,10 @@ class Executor:
                 side=order_side,
             )
 
-            resp = self.client.create_and_post_order(order_args, OrderType.GTC)
+            options = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+            resp = self._retry_api(
+                lambda: self.client.create_and_post_order(order_args, options)
+            )
 
             if not resp:
                 return OrderResult(False, None, "empty_response", error="No response from CLOB")
@@ -435,7 +503,7 @@ class Executor:
             return []
 
         try:
-            clob_orders = self.client.get_orders() or []
+            clob_orders = self._retry_api(lambda: self.client.get_orders()) or []
             clob_by_id = {o.get("id", ""): o for o in clob_orders}
         except Exception:
             logger.exception("Failed to fetch orders for fill check")
@@ -459,17 +527,44 @@ class Executor:
                 elif clob_status in ("cancelled", "expired"):
                     tracked.status = clob_status
             else:
-                # Order not in CLOB — could be fully filled and removed, or expired
+                # Order not in open orders list — query its actual status
                 age = time.time() - tracked.placed_at
                 if age > self.config.order_timeout_seconds:
                     tracked.status = "expired"
-                    logger.info("Order expired (not in CLOB): %s", tracked.order_id[:20])
+                    logger.info("Order expired (not in CLOB after %.0fs): %s", age, tracked.order_id[:20])
                 else:
-                    # Assume filled if recently placed and gone from book
-                    tracked.status = "filled"
-                    tracked.filled_shares = tracked.size_shares
-                    newly_filled.append(tracked)
-                    logger.info("Order likely filled (gone from book): %s", tracked.order_id[:20])
+                    # Query the specific order to verify its real status
+                    try:
+                        specific = self._retry_api(
+                            lambda oid=tracked.order_id: self.client.get_order(oid)
+                        )
+                        if specific:
+                            filled = float(specific.get("size_matched", 0))
+                            status = specific.get("status", "").lower()
+                            if filled > 0 and filled >= tracked.size_shares * 0.95:
+                                tracked.status = "filled"
+                                tracked.filled_shares = filled
+                                newly_filled.append(tracked)
+                                logger.info(
+                                    "Order confirmed filled via get_order: %s (%.1f shares)",
+                                    tracked.order_id[:20], filled,
+                                )
+                            elif status in ("cancelled", "expired"):
+                                tracked.status = status
+                                logger.info("Order %s via get_order: %s", status, tracked.order_id[:20])
+                            else:
+                                logger.debug(
+                                    "Order %s status=%s filled=%.1f — still tracking",
+                                    tracked.order_id[:20], status, filled,
+                                )
+                        else:
+                            logger.warning(
+                                "Order %s not found via get_order — marking expired",
+                                tracked.order_id[:20],
+                            )
+                            tracked.status = "expired"
+                    except Exception:
+                        logger.warning("Failed to query order %s — will retry next cycle", tracked.order_id[:20])
 
         return newly_filled
 
@@ -488,6 +583,12 @@ class Executor:
 
         Called by the engine when an interval resolves.
         Updates paper balance based on win/loss.
+
+        Balance model: collateral is LOCKED on placement (not subtracted from balance).
+        available = balance - locked. So:
+        - WIN: add profit to balance, release lock → available goes up by pnl
+        - LOSS: subtract collateral from balance, release lock → available unchanged
+                (the loss was already "pre-paid" via the lock reducing available)
         """
         if not self.dry_run:
             return
@@ -503,22 +604,23 @@ class Executor:
             if won:
                 # Sold a contract that resolved to $0 — keep the sale proceeds
                 pnl = order.price * shares
-                self._paper_balance += collateral + pnl  # Return collateral + profit
+                self._paper_balance += pnl  # Profit only; collateral returned via unlock
             else:
                 # Contract resolved to $1 — lose the collateral
                 pnl = -collateral
-                # Collateral already deducted, nothing returned
+                self._paper_balance -= collateral  # Forfeit the locked collateral
         else:
             cost = order.price * shares
             if won:
                 # Bought a contract that resolved to $1 — receive $1 per share
                 pnl = (1.0 - order.price) * shares
-                self._paper_balance += cost + pnl  # Return cost + profit
+                self._paper_balance += pnl  # Profit only; cost returned via unlock
             else:
                 # Contract resolved to $0 — lose the cost
                 pnl = -cost
-                # Cost already deducted, nothing returned
+                self._paper_balance -= cost  # Forfeit the locked cost
 
+        # Release the collateral lock (win or lose, the position is closed)
         self._paper_collateral_locked = max(0, self._paper_collateral_locked - abs(
             (1.0 - order.price) * shares if order.is_sell else order.price * shares
         ))
@@ -558,7 +660,7 @@ class Executor:
             return True
 
         try:
-            self.client.cancel(order_id=order_id)
+            self._retry_api(lambda: self.client.cancel(order_id=order_id))
             if order_id in self.tracked_orders:
                 self.tracked_orders[order_id].status = "cancelled"
             logger.info("Cancelled order %s", order_id[:20])
@@ -581,7 +683,7 @@ class Executor:
             return True
 
         try:
-            self.client.cancel_all()
+            self._retry_api(lambda: self.client.cancel_all())
             for o in self.tracked_orders.values():
                 if o.status == "open":
                     o.status = "cancelled"
@@ -607,7 +709,9 @@ class Executor:
             return available
 
         try:
-            result = self.client.get_balance_allowance(asset_type="COLLATERAL")
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._retry_api(lambda: self.client.get_balance_allowance(params))
             return float(result.get("balance", 0))
         except Exception:
             logger.exception("Failed to get balance")
