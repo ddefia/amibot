@@ -60,12 +60,17 @@ class PriceFeed:
     # Fallback: Binance US or CoinGecko if main Binance is geo-blocked
     BINANCE_US_REST = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT"
     COINGECKO_REST = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+    # Additional fallbacks for geo-restricted servers
+    KRAKEN_REST = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+    COINBASE_REST = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
     RTDS_WS = "wss://ws-live-data.polymarket.com"
 
     # After this many consecutive WS failures, switch to REST polling
     WS_FAIL_THRESHOLD = 3
     # REST polling interval (seconds) — slower than WS but works everywhere
     REST_POLL_INTERVAL = 2.0
+    # If a WS is connected but no valid data arrives in this many seconds, force REST fallback
+    WS_STALE_DATA_TIMEOUT = 30.0
 
     def __init__(self):
         self.latest_binance: PriceTick | None = None
@@ -201,16 +206,34 @@ class PriceFeed:
                     await ws.send(sub_msg)
                     logger.info("Connected to Polymarket RTDS Chainlink stream")
                     self._chainlink_ws_fails = 0
+                    connect_time = time.time()
+                    got_valid_price = False
                     async for msg in ws:
                         if not self._running:
                             break
+
+                        # If connected but no valid price data after timeout, force fallback
+                        if not got_valid_price and (time.time() - connect_time) > self.WS_STALE_DATA_TIMEOUT:
+                            logger.warning(
+                                "Chainlink RTDS connected but no valid price data after %.0fs — forcing REST fallback",
+                                self.WS_STALE_DATA_TIMEOUT,
+                            )
+                            self._chainlink_ws_fails = self.WS_FAIL_THRESHOLD
+                            break
+
                         try:
                             data = json.loads(msg)
-                            if "value" not in data:
+
+                            # Try multiple known RTDS message formats
+                            price_val = data.get("value") or data.get("price") or data.get("p")
+                            if price_val is None:
+                                # Log first few unrecognized messages for debugging
+                                if not got_valid_price:
+                                    logger.debug("Chainlink RTDS msg (no price field): %s", str(msg)[:200])
                                 continue
 
                             # Validate timestamp — reject if missing (can't measure lag)
-                            raw_ts = data.get("timestamp")
+                            raw_ts = data.get("timestamp") or data.get("t")
                             if raw_ts:
                                 ts_ms = int(raw_ts)
                             else:
@@ -220,11 +243,12 @@ class PriceFeed:
                             tick = PriceTick(
                                 source="chainlink",
                                 symbol="BTC/USD",
-                                price=float(data["value"]),
+                                price=float(price_val),
                                 timestamp_ms=ts_ms,
                             )
                             self.latest_chainlink = tick
                             self._chainlink_last_update = time.time()
+                            got_valid_price = True
                             await self._notify(tick)
                         except (KeyError, ValueError) as e:
                             logger.warning("Bad Chainlink message: %s", e)
@@ -245,20 +269,23 @@ class PriceFeed:
         return self._http_client
 
     async def _binance_rest_poll(self):
-        """Poll Binance REST API for BTC price. Fallback when WS is blocked.
+        """Poll REST APIs for BTC price. Fallback when WS is blocked.
 
-        Tries Binance global → Binance US → CoinGecko in order.
-        Slower than WS (~2s interval) but works through firewalls.
+        Tries multiple endpoints in order, sticks with the first one that works.
+        Includes Binance, Kraken, Coinbase, CoinGecko for maximum geo-coverage.
         """
         client = self._get_http_client()
         endpoints = [
             ("Binance", self.BINANCE_REST),
             ("Binance US", self.BINANCE_US_REST),
+            ("Kraken", self.KRAKEN_REST),
+            ("Coinbase", self.COINBASE_REST),
             ("CoinGecko", self.COINGECKO_REST),
         ]
         active_endpoint_idx = 0
+        consecutive_failures = 0
 
-        logger.info("Binance REST polling started (every %.0fs)", self.REST_POLL_INTERVAL)
+        logger.info("BTC REST polling started (every %.0fs) — trying %d endpoints", self.REST_POLL_INTERVAL, len(endpoints))
 
         while self._running:
             name, url = endpoints[active_endpoint_idx]
@@ -270,6 +297,13 @@ class PriceFeed:
                 # Parse price based on which API we're hitting
                 if "CoinGecko" in name:
                     price = float(data["bitcoin"]["usd"])
+                elif "Kraken" in name:
+                    # Kraken returns: {"result": {"XXBTZUSD": {"c": ["97000.0", ...]}}}
+                    pair_data = next(iter(data.get("result", {}).values()))
+                    price = float(pair_data["c"][0])
+                elif "Coinbase" in name:
+                    # Coinbase returns: {"data": {"amount": "97000.00", ...}}
+                    price = float(data["data"]["amount"])
                 else:
                     price = float(data["price"])
 
@@ -282,14 +316,25 @@ class PriceFeed:
                 )
                 self.latest_binance = tick
                 self._binance_last_update = time.time()
+                consecutive_failures = 0  # Reset on success
+
+                # Log which endpoint is working (once)
+                if not hasattr(self, '_logged_working_endpoint') or self._logged_working_endpoint != name:
+                    logger.info("BTC price feed active via %s ($%.0f)", name, price)
+                    self._logged_working_endpoint = name
+
                 await self._notify(tick)
 
             except Exception as e:
-                logger.warning("Binance REST (%s) error: %s", name, e)
-                # Try next endpoint
+                logger.warning("BTC REST (%s) error: %s", name, e)
+                consecutive_failures += 1
+                # Rotate to next endpoint
                 active_endpoint_idx = (active_endpoint_idx + 1) % len(endpoints)
-                if active_endpoint_idx == 0:
-                    logger.error("All Binance REST endpoints failed")
+                if consecutive_failures >= len(endpoints):
+                    logger.error("All %d BTC REST endpoints failed — retrying in 10s", len(endpoints))
+                    consecutive_failures = 0
+                    await asyncio.sleep(10)
+                    continue
 
             await asyncio.sleep(self.REST_POLL_INTERVAL)
 
