@@ -193,7 +193,7 @@ LOG_LEVEL=INFO
 LOG_FILE=bot.log
 TRADE_LOG=trades.jsonl
 ENVEOF
-    echo "  Default .env created (paper trading, $100 balance)"
+    echo '  Default .env created (paper trading, $100 balance)'
 else
     echo "  .env already exists — keeping current config"
 fi
