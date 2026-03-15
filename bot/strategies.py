@@ -88,7 +88,7 @@ class LatencyArbStrategy:
     # Price gate — only sell when contract is in this range
     # Wider than Guy 1's $0.51 target because REST mode lacks latency edge.
     # Edge gate (>= 3%) still prevents unprofitable trades at extreme prices.
-    MIN_SELL_PRICE = 0.35  # Below this, edge is negative at typical confidence levels
+    MIN_SELL_PRICE = 0.10  # Lowered for paper testing — see trades at more price levels
     MAX_SELL_PRICE = 0.65  # Above this, market has already moved against us
 
     # Position sizing from Guy 1's data
@@ -98,8 +98,8 @@ class LatencyArbStrategy:
 
     # Cross-trader lesson: 5-min intervals are net losers (-$8.4K across 497 positions)
     # Require higher edge/confidence on 5-min to compensate
-    FIVE_MIN_EDGE_MULTIPLIER = 1.5   # 50% higher edge required for 5-min
-    FIVE_MIN_CONFIDENCE_BOOST = 0.08  # Need 8% more confidence for 5-min
+    FIVE_MIN_EDGE_MULTIPLIER = 1.2   # 20% higher edge required for 5-min (relaxed for paper)
+    FIVE_MIN_CONFIDENCE_BOOST = 0.03  # Need 3% more confidence for 5-min
 
     # Cross-trader lesson: feed disagreement kills edge (Guy 5 pattern)
     # Stronger penalty than before — disagreement means low conviction
@@ -120,7 +120,7 @@ class LatencyArbStrategy:
     # Paper session: 3 early fakeout losses at t=132-159s with 7.8-9.2% edge.
     #   2.0x multiplier requires 10% edge early → would have filtered all 3.
     EARLY_PHASE_END = 300       # First 5 min = "early" (high reversal risk)
-    EARLY_EDGE_MULTIPLIER = 2.0 # 100% higher edge required in early phase
+    EARLY_EDGE_MULTIPLIER = 1.3 # 30% higher edge required in early phase (relaxed for paper)
 
     # Cross-trader lesson: scale position size with confidence (r=0.14 correlation)
     # Higher confidence → bigger position (like winners across all traders)
@@ -202,9 +202,9 @@ class LatencyArbStrategy:
         time_factor = seconds_into_interval / interval_duration
         move_magnitude = abs(binance_pct_move) * 10000  # in bps
 
-        # Need at least 2bps movement to have directional conviction
-        # (lowered from 3 for REST mode — catch moves before market fully adjusts)
-        if move_magnitude < 2:
+        # Need at least 1bps movement to have directional conviction
+        # (lowered for paper testing — catch smaller moves)
+        if move_magnitude < 1:
             return Signal(Side.NONE, 0, 0, 0, 0,
                           f"Move too small ({move_magnitude:.1f}bps < 2bps) "
                           f"BTC ${current_binance_price:.0f} vs start ${interval_start_price:.0f}")
