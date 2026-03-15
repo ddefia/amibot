@@ -24,7 +24,7 @@ import logging
 from bot.config import Config
 from bot.market_scanner import MarketScanner, MarketOpportunity
 from bot.multi_feed import MultiFeed
-from bot.data_edge import DataEdgeAggregator
+from bot.data_edge import DataEdgeAggregator, DataSignal
 from bot.strategies import LatencyArbStrategy, MispricingStrategy, MarketMakingStrategy, Signal, Side
 from bot.executor import Executor
 from bot.risk import RiskManager
@@ -408,10 +408,35 @@ class UnifiedEngine:
             if not data_signal:
                 continue
 
+            # For news/reddit signals with unknown direction, infer from market price:
+            # if YES side is cheap (<0.40), lean YES; if NO side is cheap, lean NO
             if data_signal.direction == "unknown":
-                continue
+                up_p = up_token.get("price", 0.5)
+                down_p = down_token.get("price", 0.5)
+                if up_p < 0.40:
+                    data_signal = DataSignal(
+                        source=data_signal.source,
+                        market_keyword=data_signal.market_keyword,
+                        direction="yes",
+                        confidence=min(0.65, data_signal.confidence + 0.1),
+                        data_value=data_signal.data_value,
+                        timestamp=data_signal.timestamp,
+                        details=data_signal.details,
+                    )
+                elif down_p < 0.40:
+                    data_signal = DataSignal(
+                        source=data_signal.source,
+                        market_keyword=data_signal.market_keyword,
+                        direction="no",
+                        confidence=min(0.65, data_signal.confidence + 0.1),
+                        data_value=data_signal.data_value,
+                        timestamp=data_signal.timestamp,
+                        details=data_signal.details,
+                    )
+                else:
+                    continue  # Both sides near 50/50, no edge
 
-            if data_signal.confidence < 0.6:
+            if data_signal.confidence < 0.55:
                 continue
 
             # Build a trading signal from the data edge
@@ -579,12 +604,13 @@ class UnifiedEngine:
         # Risk check
         allowed, reason = self.risk.check_allowed(signal)
         if not allowed:
-            logger.debug("Blocked by risk (%s): %s", label, reason)
+            logger.info("Blocked by risk (%s): %s", label, reason)
             return
 
         # Adjust size
         adjusted_size = self.risk.adjust_size(signal)
         if adjusted_size <= 0:
+            logger.info("Blocked by sizing (%s): adjusted to $0 (Kelly too small)", label)
             return
         if adjusted_size != signal.size:
             signal = Signal(
@@ -596,7 +622,7 @@ class UnifiedEngine:
                 reason=signal.reason,
             )
 
-        # Select token
+        # Select token — handle both binary (UP/DOWN) and multi-outcome markets
         up_token = market.tokens.get("UP", {})
         down_token = market.tokens.get("DOWN", {})
 
@@ -604,6 +630,18 @@ class UnifiedEngine:
             token_id = up_token.get("token_id")
         else:
             token_id = down_token.get("token_id")
+
+        # Fallback for multi-outcome markets: pick cheapest token
+        if not token_id:
+            cheapest = None
+            for label, tok in market.tokens.items():
+                tid = tok.get("token_id")
+                if not tid:
+                    continue
+                if cheapest is None or tok.get("price", 1) < cheapest.get("price", 1):
+                    cheapest = tok
+            if cheapest:
+                token_id = cheapest.get("token_id")
 
         if not token_id:
             return

@@ -246,8 +246,8 @@ class RiskManager:
                             self.config.max_pct_per_trade * 100, self.current_balance)
                 size = max_from_bankroll
 
-        # Minimum viable position (low floor for live testing with small balances)
-        if size < 5:
+        # Minimum viable position
+        if size < 1:
             return 0.0
 
         return round(size, 2)

@@ -428,9 +428,9 @@ class DataEdgeAggregator:
         for signal in self._signals:
             # Check if any signal keywords appear in the market question
             keywords = signal.market_keyword.split()
-            match_count = sum(1 for kw in keywords if len(kw) > 3 and kw in question_lower)
+            match_count = sum(1 for kw in keywords if len(kw) >= 3 and kw in question_lower)
 
-            if match_count >= 2:  # At least 2 keyword matches
+            if match_count >= 1:  # At least 1 keyword match (was 2)
                 return signal
 
         return None
