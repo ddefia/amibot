@@ -111,6 +111,12 @@ class UnifiedEngine:
         self._signals_rejected: int = 0
         self._markets_scanned: int = 0
 
+        # Dashboard history (ring buffers for charts)
+        self._pnl_history: list[dict] = []        # [{ts, balance, pnl, exposure}]
+        self._signal_log: list[dict] = []          # [{ts, asset, strategy, reason, side, edge, conf}]
+        self._last_pnl_snapshot: float = 0
+        self._pnl_snapshot_interval: float = 30    # snapshot every 30s
+
     async def run(self):
         """Main entry point — start all subsystems concurrently."""
         self._running = True
@@ -177,6 +183,20 @@ class UnifiedEngine:
 
         # Periodic stats report
         self._log_periodic_stats()
+
+        # P&L snapshot for dashboard chart
+        if (now - self._last_pnl_snapshot) >= self._pnl_snapshot_interval:
+            self._last_pnl_snapshot = now
+            stats = self.risk.get_stats()
+            self._pnl_history.append({
+                "ts": now,
+                "balance": round(stats["current_balance"], 2),
+                "pnl": round(stats["total_pnl"], 2),
+                "exposure": round(stats["current_exposure"], 2),
+            })
+            # Keep last 2 hours of data (240 points at 30s intervals)
+            if len(self._pnl_history) > 240:
+                self._pnl_history = self._pnl_history[-240:]
 
         # Periodic market scan
         if (now - self._last_scan_ts) > self._scan_interval:
@@ -291,6 +311,13 @@ class UnifiedEngine:
             )
 
             self._signals_evaluated += 1
+            self._record_signal(
+                asset=asset.upper(), strategy="oracle_lag",
+                side=signal.side.value if signal.side != Side.NONE else "none",
+                edge=signal.edge, confidence=signal.confidence,
+                reason=signal.reason,
+                accepted=signal.side != Side.NONE,
+            )
             if signal.side == Side.NONE:
                 self._signals_rejected += 1
                 if self._tick_count % 60 == 0:
@@ -705,6 +732,24 @@ class UnifiedEngine:
             self.data_edge.close(),
             return_exceptions=True,
         )
+
+    def _record_signal(self, asset: str, strategy: str, side: str,
+                        edge: float, confidence: float, reason: str,
+                        accepted: bool):
+        """Record a signal evaluation for the dashboard feed."""
+        self._signal_log.append({
+            "ts": time.time(),
+            "asset": asset,
+            "strategy": strategy,
+            "side": side,
+            "edge": round(edge, 4),
+            "confidence": round(confidence, 4),
+            "reason": reason[:120],
+            "accepted": accepted,
+        })
+        # Keep last 200 signals
+        if len(self._signal_log) > 200:
+            self._signal_log = self._signal_log[-200:]
 
     def _log_event(self, event: str, data: dict):
         """Log a structured event to the trade log."""
