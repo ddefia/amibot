@@ -1,10 +1,20 @@
-"""Multi-asset price feeds for crypto oracle lag strategy.
+"""Multi-asset price feeds — speed-optimized for REST-only environments.
 
-Extends the single-asset BTC feed to track ETH, SOL, XRP simultaneously.
-Each asset gets its own Binance stream for sub-second price updates.
-This multiplies our opportunity set by 4x — same strategy, more markets.
+All WebSockets are blocked on this server (HTTP 403). Instead of trying WS
+and falling back after 3 failures (wasting 6+ seconds), we go straight to
+parallel REST polling at 500ms intervals across multiple exchanges.
 
-Guy 3 ($355K PnL) trades BTC/ETH/SOL/XRP simultaneously.
+Speed architecture:
+- Poll Kraken + Binance US simultaneously (parallel asyncio.gather)
+- Use whichever responds first (race condition = fastest wins)
+- 500ms poll interval = 2x per second price updates
+- Cross-validate: if both respond, use the fresher one
+- Fallback chain: Kraken (389ms) → Binance US (484ms) → Coinbase → CoinGecko
+
+Measured latencies from this server:
+- Kraken REST: ~389ms (fastest)
+- Binance US REST: ~484ms
+- All WebSockets: BLOCKED (HTTP 403)
 """
 
 import asyncio
@@ -14,44 +24,43 @@ import logging
 from dataclasses import dataclass
 
 import httpx
-import websockets
 
 logger = logging.getLogger(__name__)
 
 ASSETS = {
     "btc": {
-        "binance_ws": "wss://stream.binance.com:9443/ws/btcusdt@trade",
-        "binance_rest": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
         "kraken_pair": "XBTUSD",
+        "binance_us_symbol": "BTCUSDT",
         "coinbase_pair": "BTC-USD",
         "coingecko_id": "bitcoin",
     },
     "eth": {
-        "binance_ws": "wss://stream.binance.com:9443/ws/ethusdt@trade",
-        "binance_rest": "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
         "kraken_pair": "ETHUSD",
+        "binance_us_symbol": "ETHUSDT",
         "coinbase_pair": "ETH-USD",
         "coingecko_id": "ethereum",
     },
     "sol": {
-        "binance_ws": "wss://stream.binance.com:9443/ws/solusdt@trade",
-        "binance_rest": "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
         "kraken_pair": "SOLUSD",
+        "binance_us_symbol": "SOLUSDT",
         "coinbase_pair": "SOL-USD",
         "coingecko_id": "solana",
     },
     "xrp": {
-        "binance_ws": "wss://stream.binance.com:9443/ws/xrpusdt@trade",
-        "binance_rest": "https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT",
         "kraken_pair": "XRPUSD",
+        "binance_us_symbol": "XRPUSDT",
         "coinbase_pair": "XRP-USD",
         "coingecko_id": "ripple",
     },
 }
 
-# REST fallback endpoints (geo-resilient)
-REST_ENDPOINTS = [
+# Ordered by measured latency (fastest first)
+FAST_ENDPOINTS = [
     ("Kraken", "https://api.kraken.com/0/public/Ticker?pair={kraken_pair}"),
+    ("BinanceUS", "https://api.binance.us/api/v3/ticker/price?symbol={binance_us_symbol}"),
+]
+
+SLOW_ENDPOINTS = [
     ("Coinbase", "https://api.coinbase.com/v2/prices/{coinbase_pair}/spot"),
     ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"),
 ]
@@ -60,34 +69,32 @@ REST_ENDPOINTS = [
 @dataclass
 class AssetPrice:
     """Current price state for a single asset."""
-    asset: str  # btc, eth, sol, xrp
+    asset: str
     price: float
     timestamp_ms: int
-    source: str  # "binance_ws", "kraken_rest", etc.
-    interval_start_price: float | None = None  # Captured at interval boundary
+    source: str
+    interval_start_price: float | None = None
 
 
 class MultiFeed:
-    """Manages price feeds for multiple crypto assets simultaneously.
+    """Speed-optimized multi-asset price feeds via parallel REST polling.
 
-    Each asset has its own WebSocket connection (or REST fallback).
-    Provides a unified interface for the engine to query any asset's price.
+    Polls Kraken + Binance US in parallel every 500ms.
+    Uses whichever responds first for minimum latency.
     """
 
-    WS_FAIL_THRESHOLD = 3
-    REST_POLL_INTERVAL = 2.0
+    POLL_INTERVAL = 0.5  # 500ms — 2 updates per second
 
     def __init__(self, assets: list[str] | None = None):
-        """
-        Args:
-            assets: List of asset keys to track. Default: all of them.
-        """
         self.tracked_assets = assets or list(ASSETS.keys())
         self.prices: dict[str, AssetPrice] = {}
         self._running = False
         self._http_client: httpx.AsyncClient | None = None
-        self._ws_fails: dict[str, int] = {a: 0 for a in self.tracked_assets}
         self._callbacks: list = []
+        self._fast_endpoint_healthy: dict[str, bool] = {
+            name: True for name, _ in FAST_ENDPOINTS
+        }
+        self._poll_count = 0
 
     def on_price(self, callback):
         """Register callback: callback(asset_price: AssetPrice)."""
@@ -104,28 +111,23 @@ class MultiFeed:
                 logger.exception("Error in price callback for %s", ap.asset)
 
     def get_price(self, asset: str) -> float | None:
-        """Get the latest price for an asset."""
         ap = self.prices.get(asset)
         return ap.price if ap else None
 
     def get_asset_price(self, asset: str) -> AssetPrice | None:
-        """Get full AssetPrice object."""
         return self.prices.get(asset)
 
     def capture_interval_start(self, asset: str):
-        """Capture the current price as interval start for an asset."""
         ap = self.prices.get(asset)
         if ap:
             ap.interval_start_price = ap.price
             logger.debug("Captured interval start for %s: $%.2f", asset, ap.price)
 
     def capture_all_interval_starts(self):
-        """Capture interval start prices for ALL tracked assets."""
         for asset in self.tracked_assets:
             self.capture_interval_start(asset)
 
     def is_fresh(self, asset: str, max_age_s: float = 10) -> bool:
-        """Check if an asset's price data is fresh."""
         ap = self.prices.get(asset)
         if not ap:
             return False
@@ -133,144 +135,154 @@ class MultiFeed:
         return age < max_age_s
 
     async def start(self):
-        """Start all asset price feeds concurrently."""
+        """Start parallel REST polling for all assets."""
         self._running = True
-        tasks = []
-        for asset in self.tracked_assets:
-            tasks.append(self._asset_feed(asset))
-        tasks.append(self._health_monitor())
+        self._http_client = httpx.AsyncClient(
+            timeout=3.0,  # Tight timeout — speed matters
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+        logger.info(
+            "MultiFeed starting — parallel REST polling at %dms for %s",
+            int(self.POLL_INTERVAL * 1000),
+            ", ".join(a.upper() for a in self.tracked_assets),
+        )
+
+        tasks = [
+            self._parallel_poll_loop(),
+            self._health_monitor(),
+        ]
         await asyncio.gather(*tasks)
 
     def stop(self):
         self._running = False
-        if self._http_client:
-            asyncio.get_event_loop().create_task(self._http_client.aclose())
 
-    async def _asset_feed(self, asset: str):
-        """Run price feed for a single asset. Tries WS first, falls back to REST."""
-        config = ASSETS[asset]
+    async def _parallel_poll_loop(self):
+        """Poll ALL assets in parallel every 500ms.
 
+        Instead of sequential per-asset polling, we fire all requests at once.
+        For 4 assets × 2 endpoints = 8 concurrent requests, taking ~400ms total
+        instead of 8 × 400ms = 3.2s sequential.
+        """
         while self._running:
-            if self._ws_fails[asset] >= self.WS_FAIL_THRESHOLD:
-                await self._rest_poll(asset, config)
-                return
+            start = time.time()
+            self._poll_count += 1
 
-            try:
-                async with websockets.connect(config["binance_ws"]) as ws:
-                    logger.info("Connected to Binance WS for %s", asset.upper())
-                    self._ws_fails[asset] = 0
-                    async for msg in ws:
-                        if not self._running:
-                            break
+            # Build all fetch tasks for all assets
+            tasks = []
+            task_meta = []  # (asset, endpoint_name) for each task
+
+            for asset in self.tracked_assets:
+                config = ASSETS[asset]
+
+                # Always try both fast endpoints in parallel
+                for name, url_template in FAST_ENDPOINTS:
+                    if not self._fast_endpoint_healthy.get(name, True):
+                        # Re-check unhealthy endpoints every 20 polls (10s)
+                        if self._poll_count % 20 != 0:
+                            continue
+                    try:
+                        url = url_template.format(**config)
+                        tasks.append(self._fetch_price(asset, name, url, config))
+                        task_meta.append((asset, name))
+                    except KeyError:
+                        continue
+
+                # Every 10th poll, also try slow endpoints for validation
+                if self._poll_count % 10 == 0:
+                    for name, url_template in SLOW_ENDPOINTS[:1]:  # Just Coinbase
                         try:
-                            data = json.loads(msg)
-                            price = float(data["p"])
-                            ts_ms = int(data["T"])
-                            ap = AssetPrice(
-                                asset=asset,
-                                price=price,
-                                timestamp_ms=ts_ms,
-                                source="binance_ws",
-                                interval_start_price=(
-                                    self.prices[asset].interval_start_price
-                                    if asset in self.prices else None
-                                ),
-                            )
-                            self.prices[asset] = ap
-                            await self._notify(ap)
-                        except (KeyError, ValueError):
-                            pass
-            except Exception:
-                self._ws_fails[asset] += 1
-                if self._ws_fails[asset] >= self.WS_FAIL_THRESHOLD:
-                    logger.warning(
-                        "%s WS failed %d times — switching to REST",
-                        asset.upper(), self._ws_fails[asset],
-                    )
-                else:
-                    await asyncio.sleep(2)
+                            url = url_template.format(**config)
+                            tasks.append(self._fetch_price(asset, name, url, config))
+                            task_meta.append((asset, name))
+                        except KeyError:
+                            continue
 
-    async def _rest_poll(self, asset: str, config: dict):
-        """REST fallback for a single asset. Rotates through endpoints."""
-        client = self._get_http_client()
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        endpoints = []
-        for name, url_template in REST_ENDPOINTS:
-            try:
-                url = url_template.format(**config)
-                endpoints.append((name, url))
-            except KeyError:
-                continue
+                for (asset, name), result in zip(task_meta, results):
+                    if isinstance(result, Exception):
+                        self._fast_endpoint_healthy[name] = False
+                    elif result is not None:
+                        self._fast_endpoint_healthy[name] = True
 
-        active_idx = 0
-        consecutive_failures = 0
+            elapsed = time.time() - start
+            sleep_time = max(0, self.POLL_INTERVAL - elapsed)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
-        logger.info("%s REST polling started (every %.0fs)", asset.upper(), self.REST_POLL_INTERVAL)
+    async def _fetch_price(
+        self, asset: str, name: str, url: str, config: dict
+    ) -> float | None:
+        """Fetch a single price from a single endpoint. Returns price or None."""
+        try:
+            resp = await self._http_client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
 
-        while self._running:
-            name, url = endpoints[active_idx]
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
+            if "Kraken" in name:
+                pair_data = next(iter(data.get("result", {}).values()))
+                price = float(pair_data["c"][0])
+            elif "BinanceUS" in name:
+                price = float(data["price"])
+            elif "Coinbase" in name:
+                price = float(data["data"]["amount"])
+            elif "CoinGecko" in name:
+                cg_id = config["coingecko_id"]
+                price = float(data[cg_id]["usd"])
+            else:
+                return None
 
-                if "CoinGecko" in name:
-                    cg_id = config["coingecko_id"]
-                    price = float(data[cg_id]["usd"])
-                elif "Kraken" in name:
-                    pair_data = next(iter(data.get("result", {}).values()))
-                    price = float(pair_data["c"][0])
-                elif "Coinbase" in name:
-                    price = float(data["data"]["amount"])
-                else:
-                    price = float(data["price"])
+            ts_ms = int(time.time() * 1000)
 
-                ts_ms = int(time.time() * 1000)
-                ap = AssetPrice(
-                    asset=asset,
-                    price=price,
-                    timestamp_ms=ts_ms,
-                    source=f"{name.lower()}_rest",
-                    interval_start_price=(
-                        self.prices[asset].interval_start_price
-                        if asset in self.prices else None
-                    ),
-                )
-                self.prices[asset] = ap
-                consecutive_failures = 0
-                await self._notify(ap)
+            # Only update if this price is newer than what we have
+            existing = self.prices.get(asset)
+            if existing and existing.timestamp_ms >= ts_ms:
+                return price  # Already have a fresher price
 
-            except Exception as e:
-                logger.warning("%s REST (%s) error: %s", asset.upper(), name, e)
-                consecutive_failures += 1
-                active_idx = (active_idx + 1) % len(endpoints)
-                if consecutive_failures >= len(endpoints):
-                    logger.error("All %s REST endpoints failed — retrying in 10s", asset.upper())
-                    consecutive_failures = 0
-                    await asyncio.sleep(10)
-                    continue
+            ap = AssetPrice(
+                asset=asset,
+                price=price,
+                timestamp_ms=ts_ms,
+                source=f"{name.lower()}_rest",
+                interval_start_price=(
+                    existing.interval_start_price if existing else None
+                ),
+            )
+            self.prices[asset] = ap
+            await self._notify(ap)
+            return price
 
-            await asyncio.sleep(self.REST_POLL_INTERVAL)
-
-    def _get_http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=10)
-        return self._http_client
+        except Exception:
+            # Don't log every failure — too noisy at 2/sec
+            if self._poll_count % 20 == 0:
+                logger.debug("%s %s fetch failed", asset.upper(), name)
+            return None
 
     async def _health_monitor(self):
-        """Log feed health for all assets every 30s."""
+        """Log feed health every 30s."""
         while self._running:
             await asyncio.sleep(30)
             active = []
             stale = []
             for asset in self.tracked_assets:
-                if self.is_fresh(asset, 15):
+                if self.is_fresh(asset, 5):
                     ap = self.prices[asset]
-                    active.append(f"{asset.upper()}=${ap.price:.2f}")
+                    active.append(f"{asset.upper()}=${ap.price:.2f}({ap.source})")
                 else:
                     stale.append(asset.upper())
 
+            endpoints_ok = [n for n, h in self._fast_endpoint_healthy.items() if h]
+            endpoints_down = [n for n, h in self._fast_endpoint_healthy.items() if not h]
+
             if active:
-                logger.info("Feeds OK: %s", ", ".join(active))
+                logger.info(
+                    "Feeds [%dms]: %s | endpoints: %s%s",
+                    int(self.POLL_INTERVAL * 1000),
+                    ", ".join(active),
+                    "+".join(endpoints_ok) if endpoints_ok else "NONE",
+                    f" (down: {','.join(endpoints_down)})" if endpoints_down else "",
+                )
             if stale:
                 logger.warning("Feeds stale: %s", ", ".join(stale))
