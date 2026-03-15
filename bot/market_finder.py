@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Finds active BTC Up/Down markets on Polymarket via the Gamma API.
 
 These markets use epoch-based slugs that encode the interval start time:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Universal market scanner — finds ALL tradeable markets on Polymarket.
 
 Not just BTC up/down. Scans every active market across all categories:

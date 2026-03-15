@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Trading strategies for BTC 5-min/15-min Polymarket markets.
 
 Implements strategies reverse-engineered from deep trade-by-trade analysis
@@ -12,6 +14,9 @@ of 5 real Polymarket traders (PDF reports, CSV data, screenshots):
 
 3. Market Making — provide liquidity on both sides, earn spread + rebates
 
+4. Calibration Edge — DATA-DRIVEN from 40GB Polymarket analysis (8M+ trades)
+   Buy YES on 55-65c contracts (+2.2pp edge), fade longshots below 45c.
+
 CROSS-TRADER LESSONS (3,029 BTC positions analyzed):
 - 15-min intervals: +$305K total PnL (50.7% WR) — PREFER these
 - 5-min intervals: -$8.4K total PnL (48.3% WR) — AVOID or require higher edge
@@ -20,12 +25,26 @@ CROSS-TRADER LESSONS (3,029 BTC positions analyzed):
 - Larger positions correlate with wins (r=0.14) — scale up on confidence
 - Feed disagreement kills edge — Guy 5 lost $19K on Down bets without confirmation
 - Losses are almost always -100% — binary outcomes, no partial recovery
+
+DATA-DRIVEN CALIBRATION (389K resolved markets, 8M+ trades):
+- Favorite-longshot bias CONFIRMED: below 50c overpriced, above 50c underpriced
+- Best edge: 60-65c at +2.22pp, 55-60c at +1.87pp
+- Death zone confirmed: 35-45c at -1.6 to -1.7pp
+- Large traders ($500+) show +0.94pp edge vs micro (<$10) at -0.05pp
 """
 
 import time
 import logging
 from dataclasses import dataclass
 from enum import Enum
+
+from bot.calibration import (
+    get_edge_for_price,
+    get_calibration_adjustment,
+    score_market_opportunity,
+    get_size_edge_multiplier,
+    is_positive_ev,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +265,40 @@ class LatencyArbStrategy:
                 raw_confidence = min(0.97, raw_confidence + self.VOLUME_DIRECTION_BOOST)
                 volume_label += " sell-driven"
 
+        # CALIBRATION BOOST: Apply data-driven edge from 8M+ trade analysis.
+        # If the contract we're about to sell is in a historically overpriced zone,
+        # boost confidence. If it's in an underpriced zone, penalize.
+        cal_score = score_market_opportunity(market_up_price, market_down_price)
+        calibration_label = ""
+        if cal_score["edge"] > 0.5:
+            # Calibration data supports a direction — apply boost
+            cal_boost = cal_score["confidence_boost"]
+            if binance_delta > 0 and cal_score["best_side"] == "yes":
+                # BTC going up AND calibration says YES (up) is underpriced → stronger signal
+                raw_confidence = min(0.97, raw_confidence + cal_boost)
+                calibration_label = f"CAL+{cal_boost:.0%}"
+            elif binance_delta < 0 and cal_score["best_side"] == "no":
+                # BTC going down AND calibration says NO (down) is underpriced → stronger signal
+                raw_confidence = min(0.97, raw_confidence + cal_boost)
+                calibration_label = f"CAL+{cal_boost:.0%}"
+            elif binance_delta > 0 and cal_score["best_side"] == "no":
+                # BTC going up BUT calibration says NO is better → conflicting, penalize
+                raw_confidence *= 0.95
+                calibration_label = "CAL-conflict"
+            elif binance_delta < 0 and cal_score["best_side"] == "yes":
+                raw_confidence *= 0.95
+                calibration_label = "CAL-conflict"
+
+        # Data-driven death zone filter: 35-45c contracts are -1.6pp EV
+        # If we're about to sell a contract priced in the sweet spot (55-65c),
+        # that means the OTHER side is 35-45c — the buyer is in the death zone.
+        # This is GOOD for us as sellers.
+        cal_adj = get_calibration_adjustment(market_down_price if binance_delta > 0 else market_up_price)
+        if cal_adj < -0.01:
+            # The contract we're selling is overpriced per calibration → extra edge
+            raw_confidence = min(0.97, raw_confidence + abs(cal_adj) * 2)
+            calibration_label += " sell-overpriced"
+
         # SELL-SIDE LOGIC (Guy 1's actual approach):
         # Sell the contract on the LOSING side (the one about to go to $0)
         if binance_delta > 0:
@@ -330,7 +383,136 @@ class LatencyArbStrategy:
                 f"conf={raw_confidence:.1%} edge={edge:.1%} | "
                 f"feeds={'AGREE' if feeds_agree else 'DISAGREE'} | "
                 f"{volume_label + ' | ' if volume_label else ''}"
+                f"{calibration_label + ' | ' if calibration_label else ''}"
                 f"t={seconds_into_interval}s/{interval_duration}s"
+            ),
+        )
+
+
+class CalibrationEdgeStrategy:
+    """Data-driven strategy: exploit systematic Polymarket calibration errors.
+
+    Derived from 40GB of historical Polymarket data (8M+ trades, 389K resolved markets).
+
+    THE CORE INSIGHT:
+    Polymarket has a favorite-longshot bias. Contracts priced 55-65c win MORE
+    often than their price implies. Contracts priced 35-45c win LESS often.
+
+    STRATEGY:
+    1. "Buy the Favorite": Buy YES on any contract priced 55-65c (+2.2pp edge)
+    2. "Fade Longshots": Buy NO when YES is priced 35-45c (+1.6pp edge)
+    3. "High-confidence grind": Buy YES at 85-95c for low-variance +1.0pp
+    4. AVOID: Extreme longshots (0-10c), 95-100c (capital inefficient)
+
+    This is NOT about predicting outcomes — it's about systematic market bias.
+    Over hundreds of trades, the edge compounds.
+
+    Expected returns (from empirical data):
+    - 60-65c contracts: 3.5% return on capital per trade
+    - 55-60c contracts: 3.2% return on capital per trade
+    - 85-95c contracts: 0.9% return, but 89-94% win rate (low variance)
+    """
+
+    # Price zones and their properties
+    # Format: (low, high, edge_pp, min_volume, strategy_label)
+    SWEET_SPOTS = [
+        (0.55, 0.65, 2.0, 5000, "prime_buy_yes"),     # BEST: +2.0-2.2pp edge
+        (0.65, 0.80, 1.1, 5000, "good_buy_yes"),      # GOOD: +0.7-1.5pp edge
+        (0.80, 0.95, 0.8, 10000, "grind_buy_yes"),    # GRIND: +0.7-1.0pp, high WR
+    ]
+
+    FADE_ZONES = [
+        (0.35, 0.45, 1.6, 5000, "fade_longshot"),     # Overpriced → buy NO
+        (0.20, 0.35, 0.8, 10000, "fade_deep_longshot"),
+    ]
+
+    # Minimum thresholds
+    MIN_EDGE_PP = 0.5          # At least 0.5 percentage point edge
+    MIN_VOLUME = 5000          # $5K minimum market volume
+    MIN_CONFIDENCE = 0.55      # Base confidence from calibration data
+
+    def __init__(
+        self,
+        position_usd: float = 1000,
+        max_position_usd: float = 3000,
+        aggression: float = 1.0,  # 0.5 = conservative, 1.0 = normal, 1.5 = aggressive
+    ):
+        self.position_usd = position_usd
+        self.max_position_usd = max_position_usd
+        self.aggression = aggression
+
+    def evaluate(
+        self,
+        yes_price: float,
+        no_price: float,
+        market_volume: float = 0,
+        market_question: str = "",
+    ) -> Signal:
+        """Evaluate a market for calibration edge opportunities.
+
+        Args:
+            yes_price: Current YES/Up price (0-1)
+            no_price: Current NO/Down price (0-1)
+            market_volume: 24h volume in USD
+            market_question: Market question text (for logging)
+        """
+        # Get calibration score from the empirical data
+        cal = score_market_opportunity(yes_price, no_price)
+
+        if cal["best_side"] == "none":
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"No calibration edge: {cal['reason']}")
+
+        edge_pp = cal["edge"]
+
+        # Minimum edge filter (adjusted by aggression)
+        min_edge = self.MIN_EDGE_PP / self.aggression
+        if edge_pp < min_edge:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Edge {edge_pp:.1f}pp below threshold {min_edge:.1f}pp")
+
+        # Volume filter — thin markets are harder to enter/exit
+        if market_volume > 0 and market_volume < self.MIN_VOLUME:
+            return Signal(Side.NONE, 0, 0, 0, 0,
+                          f"Volume ${market_volume:.0f} below ${self.MIN_VOLUME}")
+
+        # Determine side and price
+        if cal["best_side"] == "yes":
+            side = Side.BUY_UP
+            price = yes_price
+        else:
+            side = Side.BUY_DOWN
+            price = no_price
+
+        # Confidence from calibration data + edge magnitude
+        # Base: 0.55 for minimum edge, up to 0.75 for max edge (2.2pp)
+        confidence = min(0.80, self.MIN_CONFIDENCE + (edge_pp / 100) * 8)
+
+        # Position sizing: scale with edge magnitude
+        # Prime zone (55-65c, +2pp): full size
+        # Good zone (65-80c, +1pp): 75% size
+        # Grind zone (80-95c, +0.8pp): 50% size (lower return per trade)
+        if edge_pp >= 1.5:
+            size_mult = 1.0
+        elif edge_pp >= 0.8:
+            size_mult = 0.75
+        else:
+            size_mult = 0.50
+
+        size = min(self.position_usd * size_mult * self.aggression, self.max_position_usd)
+
+        edge_decimal = cal["ev_per_dollar"]
+
+        return Signal(
+            side=side,
+            confidence=confidence,
+            edge=edge_decimal,
+            price=price,
+            size=round(size, 2),
+            reason=(
+                f"CALIBRATION: {cal['best_side'].upper()} @ ${price:.2f} | "
+                f"edge={edge_pp:.1f}pp | conf={confidence:.0%} | "
+                f"${size:.0f} | {cal['reason'][:60]}"
             ),
         )
 

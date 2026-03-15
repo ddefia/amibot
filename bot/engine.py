@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Main bot engine: full trade lifecycle from signal to resolution.
 
 Ties together market discovery, price feeds, strategies, risk management,

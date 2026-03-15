@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Unified multi-strategy engine — runs ALL strategies across ALL market types.
 
 Replaces the single-strategy BotEngine with a system that simultaneously runs:
@@ -5,15 +7,19 @@ Replaces the single-strategy BotEngine with a system that simultaneously runs:
 2. Arbitrage (any market where YES+NO < $1.00) — risk-free profit
 3. Data Edge (sports/weather) — faster data than Polymarket oracles
 4. Market Making (high-volume markets) — spread + maker rebates
+5. Calibration Edge — DATA-DRIVEN from 40GB historical analysis (8M+ trades)
+   Buy favorites at 55-65c, fade longshots at 35-45c.
 
 Architecture:
 - MarketScanner discovers ALL opportunities (replaces MarketFinder)
 - MultiFeed provides multi-asset crypto prices (replaces single PriceFeed)
 - DataEdgeAggregator provides weather/sports/news signals
+- CalibrationEdgeStrategy applies empirical mispricing data to ALL markets
 - Each strategy type has its own evaluation loop
 - All orders go through the same Executor + RiskManager
 
 The core principle: "The edge is not prediction. It's timing."
+The new principle: "The edge is also in the data. Markets are systematically miscalibrated."
 """
 
 import asyncio
@@ -25,7 +31,11 @@ from bot.config import Config
 from bot.market_scanner import MarketScanner, MarketOpportunity
 from bot.multi_feed import MultiFeed
 from bot.data_edge import DataEdgeAggregator, DataSignal
-from bot.strategies import LatencyArbStrategy, MispricingStrategy, MarketMakingStrategy, Signal, Side
+from bot.strategies import (
+    LatencyArbStrategy, MispricingStrategy, MarketMakingStrategy,
+    CalibrationEdgeStrategy, Signal, Side,
+)
+from bot.calibration import score_market_opportunity, get_edge_for_price, is_positive_ev
 from bot.executor import Executor
 from bot.risk import RiskManager
 
@@ -77,6 +87,11 @@ class UnifiedEngine:
             spread_target=0.04,
             max_position=config.position_usd * 0.5,
         )
+        self.calibration_strategy = CalibrationEdgeStrategy(
+            position_usd=config.position_usd * 0.75,  # Slightly smaller — systematic edge, many trades
+            max_position_usd=config.position_usd * 1.5,
+            aggression=1.0,
+        )
 
         # State
         self._running = False
@@ -100,9 +115,14 @@ class UnifiedEngine:
         self._mm_inventory: dict[str, dict] = {}  # slug → {"up": shares, "down": shares}
         self._last_mm_check: float = 0
 
+        # Calibration edge tracking
+        self._calibration_traded: set[str] = set()  # slugs already evaluated this cycle
+        self._last_calibration_check: float = 0
+        self._calibration_cooldown: float = 20  # seconds between calibration scans
+
         # Stats
         self._trades_by_strategy: dict[str, int] = {
-            "oracle_lag": 0, "arb": 0, "data_edge": 0, "mm": 0,
+            "oracle_lag": 0, "arb": 0, "data_edge": 0, "mm": 0, "calibration": 0,
         }
         self._start_time: float = time.time()
         self._last_stats_report: float = 0
@@ -216,6 +236,7 @@ class UnifiedEngine:
         # Evaluate each strategy type
         await self._evaluate_crypto_oracle()
         await self._evaluate_arbitrage()
+        await self._evaluate_calibration_edge()
         await self._evaluate_data_edge()
         await self._evaluate_market_making()
 
@@ -390,7 +411,111 @@ class UnifiedEngine:
         if len(self._arb_traded) > 200:
             self._arb_traded.clear()
 
-    # ---- STRATEGY 3: Data Edge ----
+    # ---- STRATEGY 3: Calibration Edge (DATA-DRIVEN) ----
+
+    async def _evaluate_calibration_edge(self):
+        """Apply calibration edge to ALL active markets with sufficient volume.
+
+        This is the data-driven strategy from 40GB of historical analysis.
+        It finds markets where prices fall in systematically mispriced zones
+        (55-65c for buying YES, 35-45c for fading longshots) and trades them.
+
+        Unlike oracle lag (which needs fast price feeds) or arb (which needs
+        combined < $1.00), this works on ANY binary market with volume.
+        """
+        # Rate limit: check every N seconds
+        if (time.time() - self._last_calibration_check) < self._calibration_cooldown:
+            return
+        self._last_calibration_check = time.time()
+
+        # Don't trade calibration if we're already at high exposure
+        if self.risk.total_exposure > self.config.max_exposure_usdc * 0.5:
+            return
+
+        # Find all markets not already handled by other strategies
+        crypto_slugs = {m.slug for m in self._opportunities if m.category == "crypto_oracle"}
+        arb_slugs = {m.slug for m in self._opportunities if m.category == "arb"}
+
+        candidates = [
+            m for m in self._opportunities
+            if m.slug not in crypto_slugs
+            and m.slug not in arb_slugs
+            and m.slug not in self._calibration_traded
+            and m.volume_24h > 5000  # Need liquidity
+        ]
+
+        # Sort by volume (more liquid = safer to trade)
+        candidates.sort(key=lambda m: -m.volume_24h)
+
+        trades_this_cycle = 0
+        max_calibration_trades_per_cycle = 3
+
+        for market in candidates:
+            if trades_this_cycle >= max_calibration_trades_per_cycle:
+                break
+
+            up_token = market.tokens.get("UP", {})
+            down_token = market.tokens.get("DOWN", {})
+            up_price = up_token.get("price")
+            down_price = down_token.get("price")
+
+            if not up_price or not down_price:
+                continue
+
+            # Skip markets where YES+NO is way off from $1 (stale prices)
+            combined = up_price + down_price
+            if combined < 0.90 or combined > 1.10:
+                continue
+
+            # Evaluate using the calibration strategy
+            signal = self.calibration_strategy.evaluate(
+                yes_price=up_price,
+                no_price=down_price,
+                market_volume=market.volume_24h,
+                market_question=market.question,
+            )
+
+            self._signals_evaluated += 1
+            self._record_signal(
+                asset="MULTI", strategy="calibration",
+                side=signal.side.value if signal.side != Side.NONE else "none",
+                edge=signal.edge, confidence=signal.confidence,
+                reason=signal.reason,
+                accepted=signal.side != Side.NONE,
+            )
+
+            if signal.side == Side.NONE:
+                self._signals_rejected += 1
+                continue
+
+            # Feed paper prices to executor
+            if self.config.dry_run:
+                token_prices = {}
+                if up_token.get("token_id"):
+                    token_prices[up_token["token_id"]] = up_price
+                if down_token.get("token_id"):
+                    token_prices[down_token["token_id"]] = down_price
+                if token_prices:
+                    self.executor.update_market_prices(token_prices)
+
+            logger.info(
+                "CALIBRATION EDGE: %s | YES=$%.2f NO=$%.2f | %s",
+                market.question[:50], up_price, down_price, signal.reason[:80],
+            )
+
+            await self._execute_signal(
+                signal, market, "calibration",
+                f"Cal edge {market.slug[:25]}",
+            )
+
+            self._calibration_traded.add(market.slug)
+            trades_this_cycle += 1
+
+        # Clean old slugs periodically to re-evaluate
+        if len(self._calibration_traded) > 300:
+            self._calibration_traded.clear()
+
+    # ---- STRATEGY 4: Data Edge ----
 
     async def _evaluate_data_edge(self):
         """Match data signals (sports/weather/news) to markets."""
@@ -415,12 +540,36 @@ class UnifiedEngine:
             up_token = market.tokens.get("UP", {})
             down_token = market.tokens.get("DOWN", {})
 
-            # For news/reddit signals with unknown direction, infer from market price:
-            # if YES side is cheap (<0.40), lean YES; if NO side is cheap, lean NO
+            # For news/reddit signals with unknown direction, use CALIBRATION DATA
+            # to pick the side with empirical edge instead of naive price-based guess
             if data_signal.direction == "unknown":
                 up_p = up_token.get("price", 0.5)
                 down_p = down_token.get("price", 0.5)
-                if up_p < 0.40:
+                cal = score_market_opportunity(up_p, down_p)
+                if cal["best_side"] == "yes" and cal["edge"] > 0.5:
+                    # Calibration says YES is underpriced — go with it
+                    conf_boost = cal["confidence_boost"]
+                    data_signal = DataSignal(
+                        source=data_signal.source,
+                        market_keyword=data_signal.market_keyword,
+                        direction="yes",
+                        confidence=min(0.70, data_signal.confidence + 0.1 + conf_boost),
+                        data_value=data_signal.data_value,
+                        timestamp=data_signal.timestamp,
+                        details=f"{data_signal.details} | CAL: YES +{cal['edge']:.1f}pp",
+                    )
+                elif cal["best_side"] == "no" and cal["edge"] > 0.5:
+                    conf_boost = cal["confidence_boost"]
+                    data_signal = DataSignal(
+                        source=data_signal.source,
+                        market_keyword=data_signal.market_keyword,
+                        direction="no",
+                        confidence=min(0.70, data_signal.confidence + 0.1 + conf_boost),
+                        data_value=data_signal.data_value,
+                        timestamp=data_signal.timestamp,
+                        details=f"{data_signal.details} | CAL: NO +{cal['edge']:.1f}pp",
+                    )
+                elif up_p < 0.40:
                     data_signal = DataSignal(
                         source=data_signal.source,
                         market_keyword=data_signal.market_keyword,
@@ -459,6 +608,17 @@ class UnifiedEngine:
 
             if not price or price <= 0 or price >= 0.95:
                 continue
+
+            # CALIBRATION FILTER: Don't buy into the death zone (35-45c)
+            # Even if data says direction, calibration says this price range loses money
+            if not is_positive_ev(price):
+                bucket = get_edge_for_price(price)
+                if bucket and bucket.ev_pct < -1.0:
+                    logger.debug(
+                        "Data edge blocked by calibration: %s at $%.2f is in death zone (EV=%.1f%%)",
+                        data_signal.source, price, bucket.ev_pct,
+                    )
+                    continue
 
             edge = data_signal.confidence - price
             if edge < 0.05:  # Need 5% edge
@@ -719,9 +879,10 @@ class UnifiedEngine:
             stats["win_rate"] * 100,
         )
         logger.info(
-            "By strategy: oracle_lag=%d, arb=%d, data_edge=%d, mm=%d",
+            "By strategy: oracle_lag=%d, arb=%d, calibration=%d, data_edge=%d, mm=%d",
             self._trades_by_strategy.get("oracle_lag", 0),
             self._trades_by_strategy.get("arb", 0),
+            self._trades_by_strategy.get("calibration", 0),
             self._trades_by_strategy.get("data_edge", 0),
             self._trades_by_strategy.get("mm", 0),
         )

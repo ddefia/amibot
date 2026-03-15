@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Lightweight internal dashboard — no extra dependencies.
 
 Runs on port 8080 alongside the bot. Serves a single-page dashboard

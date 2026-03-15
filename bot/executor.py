@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Order execution layer using the Polymarket CLOB API via py-clob-client.
 
 Handles order placement, fill verification, cancellation, and state sync.

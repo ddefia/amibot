@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Risk management: position sizing, loss limits, cooldowns, and bankroll protection.
 
 CROSS-TRADER LESSONS APPLIED:

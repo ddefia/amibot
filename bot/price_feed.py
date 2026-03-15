@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Real-time BTC price feeds from Binance and Polymarket RTDS (Chainlink).
 
 The latency gap between these two feeds is the core edge for the latency

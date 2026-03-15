@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Data edge strategy — trade with information faster than the market.
 
 Uses FREE public APIs to get real-world data before Polymarket prices update:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Multi-asset price feeds — adaptive WebSocket + REST for any environment.
 
 Automatically detects the fastest available transport:
