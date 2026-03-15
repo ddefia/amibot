@@ -95,6 +95,11 @@ class UnifiedEngine:
         self._arb_traded: set[str] = set()  # slugs already traded this cycle
         self._last_arb_check: float = 0
 
+        # Market making tracking
+        self._mm_active_markets: set[str] = set()  # slugs with active MM orders
+        self._mm_inventory: dict[str, dict] = {}  # slug → {"up": shares, "down": shares}
+        self._last_mm_check: float = 0
+
         # Stats
         self._trades_by_strategy: dict[str, int] = {
             "oracle_lag": 0, "arb": 0, "data_edge": 0, "mm": 0,
@@ -180,6 +185,7 @@ class UnifiedEngine:
         await self._evaluate_crypto_oracle()
         await self._evaluate_arbitrage()
         await self._evaluate_data_edge()
+        await self._evaluate_market_making()
 
     # ---- STRATEGY 1: Crypto Oracle Lag ----
 
@@ -413,6 +419,106 @@ class UnifiedEngine:
                 signal, market, "data_edge",
                 f"Data edge ({data_signal.source})",
             )
+
+    # ---- STRATEGY 4: Market Making ----
+
+    async def _evaluate_market_making(self):
+        """Post bid+ask on high-volume markets, collect spread + maker rebates.
+
+        Selects markets with good volume and spread, then places both sides.
+        Uses inventory tracking to skew quotes and avoid directional exposure.
+        """
+        # Only check every 30 seconds (MM orders sit in the book)
+        if (time.time() - self._last_mm_check) < 30:
+            return
+        self._last_mm_check = time.time()
+
+        # Don't MM if we're already at high exposure
+        if self.risk.total_exposure > self.config.max_exposure_usdc * 0.6:
+            return
+
+        # Find suitable markets: high volume, not already traded by other strategies
+        crypto_slugs = {m.slug for m in self._opportunities if m.category == "crypto_oracle"}
+        arb_slugs = {m.slug for m in self._opportunities if m.category == "arb"}
+
+        mm_candidates = [
+            m for m in self._opportunities
+            if m.slug not in crypto_slugs
+            and m.slug not in arb_slugs
+            and m.slug not in self._mm_active_markets
+            and m.volume_24h > 1000  # Minimum $1K daily volume
+            and m.spread > 0.02      # At least 2 cent spread to capture
+            and m.spread < 0.20      # Not too wide (illiquid/risky)
+        ]
+
+        # Sort by volume (higher volume = more fills)
+        mm_candidates.sort(key=lambda m: -m.volume_24h)
+
+        # Only MM on top 3 markets at a time
+        max_mm_markets = 3
+        active_count = len(self._mm_active_markets)
+
+        for market in mm_candidates[:max_mm_markets - active_count]:
+            up_token = market.tokens.get("UP", {})
+            down_token = market.tokens.get("DOWN", {})
+            up_price = up_token.get("price")
+            down_price = down_token.get("price")
+
+            if not up_price or not down_price:
+                continue
+
+            # Calculate midpoint
+            midpoint = up_price  # Up price IS the midpoint for a binary market
+
+            # Get current inventory for this market
+            inv = self._mm_inventory.get(market.slug, {"up": 0, "down": 0})
+
+            # Generate quotes
+            bid_signal, ask_signal = self.mm_strategy.get_quotes(
+                midpoint=midpoint,
+                current_inventory_up=inv["up"],
+                current_inventory_down=inv["down"],
+            )
+
+            # Feed paper prices
+            if self.config.dry_run:
+                token_prices = {}
+                if up_token.get("token_id"):
+                    token_prices[up_token["token_id"]] = up_price
+                if down_token.get("token_id"):
+                    token_prices[down_token["token_id"]] = down_price
+                if token_prices:
+                    self.executor.update_market_prices(token_prices)
+
+            # Place bid (buy UP at lower price)
+            if bid_signal.side != Side.NONE and bid_signal.price > 0.01:
+                logger.info(
+                    "MM BID: %s | %s @ $%.2f | mid=$%.2f",
+                    market.slug[:30], bid_signal.side.value,
+                    bid_signal.price, midpoint,
+                )
+                await self._execute_signal(
+                    bid_signal, market, "mm",
+                    f"MM bid {market.slug[:20]}",
+                )
+
+            # Place ask (buy DOWN = sell UP at higher price)
+            if ask_signal.side != Side.NONE and ask_signal.price > 0.01:
+                logger.info(
+                    "MM ASK: %s | %s @ $%.2f | mid=$%.2f",
+                    market.slug[:30], ask_signal.side.value,
+                    ask_signal.price, midpoint,
+                )
+                await self._execute_signal(
+                    ask_signal, market, "mm",
+                    f"MM ask {market.slug[:20]}",
+                )
+
+            self._mm_active_markets.add(market.slug)
+
+        # Clean old MM markets every 5 minutes
+        if len(self._mm_active_markets) > 10:
+            self._mm_active_markets.clear()
 
     # ---- Shared execution ----
 

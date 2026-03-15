@@ -324,6 +324,38 @@ class NewsEdge:
         except Exception as e:
             logger.debug("Google News RSS failed: %s", e)
 
+        # Reddit — free JSON API, no key needed. Faster than news sites.
+        # Monitors prediction-market-relevant subreddits for breaking info.
+        for subreddit in ["worldnews", "sports", "cryptocurrency", "politics"]:
+            try:
+                resp = await self.client.get(
+                    f"https://www.reddit.com/r/{subreddit}/hot.json?limit=5",
+                    headers={"User-Agent": "polymarket-bot/1.0"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for post in data.get("data", {}).get("children", []):
+                        title = post.get("data", {}).get("title", "")
+                        score = post.get("data", {}).get("score", 0)
+
+                        if not title or title in self._seen_headlines:
+                            continue
+                        if score < 100:  # Only high-engagement posts
+                            continue
+
+                        self._seen_headlines.add(title)
+                        signals.append(DataSignal(
+                            source=f"reddit_{subreddit}",
+                            market_keyword=title.lower()[:100],
+                            direction="unknown",
+                            confidence=min(0.6, 0.4 + score / 10000),
+                            data_value=title,
+                            timestamp=time.time(),
+                            details=f"r/{subreddit} score={score}",
+                        ))
+            except Exception as e:
+                logger.debug("Reddit r/%s failed: %s", subreddit, e)
+
         # Keep seen headlines from growing unbounded
         if len(self._seen_headlines) > 500:
             self._seen_headlines = set(list(self._seen_headlines)[-200:])
