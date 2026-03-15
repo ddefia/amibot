@@ -104,12 +104,20 @@ class UnifiedEngine:
         self._trades_by_strategy: dict[str, int] = {
             "oracle_lag": 0, "arb": 0, "data_edge": 0, "mm": 0,
         }
+        self._start_time: float = time.time()
+        self._last_stats_report: float = 0
+        self._stats_interval: float = 900  # report every 15 minutes
+        self._signals_evaluated: int = 0
+        self._signals_rejected: int = 0
+        self._markets_scanned: int = 0
 
     async def run(self):
         """Main entry point — start all subsystems concurrently."""
         self._running = True
-        mode = "DRY RUN" if self.config.dry_run else "LIVE"
-        logger.info("Unified engine starting [%s] — 4 strategies active", mode)
+        mode = "PAPER TEST" if self.config.dry_run else "LIVE"
+        logger.info("═══ Unified engine starting [%s] — 4 strategies active ═══", mode)
+        if self.config.dry_run:
+            logger.info("*** TESTING MODE — NO REAL MONEY — tracking all signals, trades, and results ***")
 
         balance = self.executor.get_balance()
         if balance is not None:
@@ -167,10 +175,14 @@ class UnifiedEngine:
         now = time.time()
         self._tick_count += 1
 
+        # Periodic stats report
+        self._log_periodic_stats()
+
         # Periodic market scan
         if (now - self._last_scan_ts) > self._scan_interval:
             try:
                 self._opportunities = await self.scanner.scan_all()
+                self._markets_scanned += len(self._opportunities)
                 self._last_scan_ts = now
             except Exception:
                 logger.exception("Market scan failed")
@@ -278,7 +290,9 @@ class UnifiedEngine:
                 current_exposure_usd=self.risk.total_exposure,
             )
 
+            self._signals_evaluated += 1
             if signal.side == Side.NONE:
+                self._signals_rejected += 1
                 if self._tick_count % 60 == 0:
                     logger.debug(
                         "%s oracle: %s | Up=$%.2f Down=$%.2f",
@@ -322,8 +336,10 @@ class UnifiedEngine:
             down_price = down_token.get("price", 0.5)
 
             signal = self.arb_strategy.evaluate(up_price, down_price)
+            self._signals_evaluated += 1
 
             if signal.side == Side.NONE:
+                self._signals_rejected += 1
                 continue
 
             logger.info(
@@ -603,17 +619,84 @@ class UnifiedEngine:
         else:
             logger.warning("[%s] Order failed: %s", strategy, result.error)
 
+    def _log_periodic_stats(self):
+        """Log a detailed stats report — runs every 15 minutes."""
+        now = time.time()
+        if (now - self._last_stats_report) < self._stats_interval:
+            return
+        self._last_stats_report = now
+
+        uptime_s = now - self._start_time
+        hours = int(uptime_s // 3600)
+        minutes = int((uptime_s % 3600) // 60)
+
+        stats = self.risk.get_stats()
+        mode = "PAPER TEST" if self.config.dry_run else "LIVE"
+
+        logger.info(
+            "═══ %s MODE — PERIODIC REPORT (uptime %dh %dm) ═══",
+            mode, hours, minutes,
+        )
+        logger.info(
+            "Balance: $%.2f (start: $%.2f) | P&L: $%+.2f | Exposure: $%.2f",
+            stats["current_balance"], stats["session_start_balance"],
+            stats["total_pnl"], stats["current_exposure"],
+        )
+        logger.info(
+            "Trades: %d placed, %d resolved | Wins: %d, Losses: %d | Win rate: %.0f%%",
+            stats["total_trades"], stats["resolved"],
+            stats["wins"], stats["losses"],
+            stats["win_rate"] * 100,
+        )
+        logger.info(
+            "By strategy: oracle_lag=%d, arb=%d, data_edge=%d, mm=%d",
+            self._trades_by_strategy.get("oracle_lag", 0),
+            self._trades_by_strategy.get("arb", 0),
+            self._trades_by_strategy.get("data_edge", 0),
+            self._trades_by_strategy.get("mm", 0),
+        )
+        logger.info(
+            "Markets scanned: %d | Signals evaluated: %d | Rejected: %d | Loss streak: %d | Halted: %s",
+            self._markets_scanned, self._signals_evaluated,
+            self._signals_rejected, stats["consecutive_losses"],
+            stats["drawdown_halted"],
+        )
+
+        # Also log to trades.jsonl for analysis
+        self._log_event("stats_report", {
+            "uptime_hours": round(uptime_s / 3600, 2),
+            "mode": mode,
+            **stats,
+            "trades_by_strategy": self._trades_by_strategy,
+            "markets_scanned": self._markets_scanned,
+            "signals_evaluated": self._signals_evaluated,
+            "signals_rejected": self._signals_rejected,
+        })
+
     def stop(self):
         """Stop all subsystems gracefully."""
+        mode = "PAPER TEST" if self.config.dry_run else "LIVE"
         logger.info("Stopping unified engine...")
         self._running = False
         self.feeds.stop()
         self.data_edge.stop()
         self.executor.cancel_all()
 
+        uptime_s = time.time() - self._start_time
+        hours = int(uptime_s // 3600)
+        minutes = int((uptime_s % 3600) // 60)
+
         stats = self.risk.get_stats()
         stats["trades_by_strategy"] = self._trades_by_strategy
+
+        logger.info("═══ %s MODE — FINAL SESSION REPORT (ran %dh %dm) ═══", mode, hours, minutes)
         logger.info("Final stats: %s", json.dumps(stats, indent=2))
+
+        self._log_event("session_end", {
+            "mode": mode,
+            "uptime_hours": round(uptime_s / 3600, 2),
+            **stats,
+        })
 
     async def close(self):
         """Clean up async resources."""

@@ -49,6 +49,9 @@ def setup_logging(config: Config):
 def print_banner(config: Config):
     mode = "DRY RUN" if config.dry_run else "LIVE"
     print("=" * 60)
+    if config.dry_run:
+        print("  *** TESTING MODE — NO REAL MONEY AT RISK ***")
+        print("=" * 60)
     print(f"  Polymarket Multi-Strategy Bot [{mode}]")
     print(f"  Strategies: Oracle Lag + Arb + Data Edge + MM")
     print(f"  Assets: BTC / ETH / SOL / XRP + all markets")
@@ -64,6 +67,7 @@ def print_banner(config: Config):
         print("  PAPER TRADING — real data, simulated orders")
         print(f"  Paper Balance: ${config.paper_balance:,.0f}")
         print(f"  Fill Rate: {config.paper_fill_rate:.0%} (liquidity sim)")
+        print("  Stats report every 15 min in bot.log")
         print("  Set DRY_RUN=false in .env for live trading")
         print("=" * 60)
 
