@@ -302,6 +302,14 @@ async function refresh() {
     const r = await fetch('/api/stats');
     const d = await r.json();
 
+    if (d.error) {
+      document.getElementById('balance').textContent = 'API Error';
+      document.getElementById('balance').className = 'big-number negative';
+      document.getElementById('pnl').textContent = d.error;
+      document.getElementById('pnl').className = 'big-number neutral';
+      return;
+    }
+
     // Mode
     const badge = document.getElementById('mode-badge');
     badge.textContent = d.mode;
@@ -394,9 +402,25 @@ async function refresh() {
   }
 }
 
+// Show loading state initially
+document.getElementById('balance').textContent = 'Loading...';
+document.getElementById('balance').className = 'big-number neutral';
+document.getElementById('pnl').textContent = '...';
+document.getElementById('win-rate').textContent = '...';
+
+async function tryRefresh() {
+  try {
+    await refresh();
+  } catch(e) {
+    document.getElementById('balance').textContent = 'Connection error';
+    document.getElementById('balance').className = 'big-number negative';
+    console.error('Dashboard error:', e);
+  }
+}
+
 // Auto-refresh every 5 seconds
-refresh();
-setInterval(refresh, 5000);
+tryRefresh();
+setInterval(tryRefresh, 5000);
 </script>
 </body>
 </html>"""
@@ -407,12 +431,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/stats":
-            data = _get_stats()
+            try:
+                data = _get_stats()
+                body = json.dumps(data).encode()
+            except Exception as e:
+                logger.exception("Dashboard /api/stats error")
+                body = json.dumps({"error": str(e)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+            self.wfile.write(body)
         elif self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
