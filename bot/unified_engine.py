@@ -249,28 +249,31 @@ class UnifiedEngine:
             current_interval = now - (now % duration)
             seconds_into = now % duration
 
+            # Key by asset + duration to avoid cross-duration resets
+            interval_key = f"{asset}_{duration}"
+
             # Detect new interval → reset state
-            if self._interval_starts.get(asset) != current_interval:
-                self._interval_starts[asset] = current_interval
-                self._positions_per_interval[asset] = 0
-                self._last_trade_ts[asset] = 0
+            if self._interval_starts.get(interval_key) != current_interval:
+                self._interval_starts[interval_key] = current_interval
+                self._positions_per_interval[interval_key] = 0
+                self._last_trade_ts[interval_key] = 0
                 self.feeds.capture_interval_start(asset)
-                self._interval_prices[asset] = ap.price
+                self._interval_prices[interval_key] = ap.price
                 logger.info(
                     "New %dm interval for %s | start=$%.2f",
                     duration // 60, asset.upper(), ap.price,
                 )
 
-            start_price = self._interval_prices.get(asset)
+            start_price = self._interval_prices.get(interval_key)
             if not start_price:
                 continue
 
             # Max positions per interval per asset
-            if self._positions_per_interval.get(asset, 0) >= self.config.max_positions_per_interval:
+            if self._positions_per_interval.get(interval_key, 0) >= self.config.max_positions_per_interval:
                 continue
 
-            # Rate limit: min 120s between trades per asset
-            last_trade = self._last_trade_ts.get(asset, 0)
+            # Rate limit: min 120s between trades per asset+duration
+            last_trade = self._last_trade_ts.get(interval_key, 0)
             if last_trade and (time.time() - last_trade) < 120:
                 continue
 
@@ -334,10 +337,10 @@ class UnifiedEngine:
             )
 
             if signal.side != Side.NONE:
-                self._positions_per_interval[asset] = (
-                    self._positions_per_interval.get(asset, 0) + 1
+                self._positions_per_interval[interval_key] = (
+                    self._positions_per_interval.get(interval_key, 0) + 1
                 )
-                self._last_trade_ts[asset] = time.time()
+                self._last_trade_ts[interval_key] = time.time()
 
     # ---- STRATEGY 2: Arbitrage ----
 
@@ -408,6 +411,10 @@ class UnifiedEngine:
             if not data_signal:
                 continue
 
+            # Get token data early — needed for direction inference and trading
+            up_token = market.tokens.get("UP", {})
+            down_token = market.tokens.get("DOWN", {})
+
             # For news/reddit signals with unknown direction, infer from market price:
             # if YES side is cheap (<0.40), lean YES; if NO side is cheap, lean NO
             if data_signal.direction == "unknown":
@@ -440,8 +447,6 @@ class UnifiedEngine:
                 continue
 
             # Build a trading signal from the data edge
-            up_token = market.tokens.get("UP", {})
-            down_token = market.tokens.get("DOWN", {})
             up_price = up_token.get("price", 0.5)
             down_price = down_token.get("price", 0.5)
 
