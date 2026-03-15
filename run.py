@@ -22,6 +22,7 @@ import traceback
 
 from bot.config import Config
 from bot.unified_engine import UnifiedEngine
+from bot.dashboard import start_dashboard
 
 logger = logging.getLogger("bot.runner")
 
@@ -68,6 +69,7 @@ def print_banner(config: Config):
         print(f"  Paper Balance: ${config.paper_balance:,.0f}")
         print(f"  Fill Rate: {config.paper_fill_rate:.0%} (liquidity sim)")
         print("  Stats report every 15 min in bot.log")
+        print("  Dashboard: http://<your-vps-ip>:8080")
         print("  Set DRY_RUN=false in .env for live trading")
         print("=" * 60)
 
@@ -104,6 +106,7 @@ def main():
 
         try:
             engine = UnifiedEngine(config)
+            start_dashboard(engine, port=8080)
 
             if restart_count > 0:
                 logger.info("=== RESTARTING (attempt %d) ===", restart_count + 1)
