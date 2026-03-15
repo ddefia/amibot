@@ -105,10 +105,17 @@ class LatencyArbStrategy:
     SELL_PRICE = 0.51
 
     # Price gate — only sell when contract is in this range
-    # Wider than Guy 1's $0.51 target because REST mode lacks latency edge.
-    # Edge gate (>= 3%) still prevents unprofitable trades at extreme prices.
-    MIN_SELL_PRICE = 0.10  # Lowered for paper testing — see trades at more price levels
+    # Backtest loss analysis: 40-50c zone = highest loss count (439 losers / $769K lost)
+    # Tightened from 0.10-0.65 based on where we actually make money
+    MIN_SELL_PRICE = 0.35  # Below this, risk/reward flips against us
     MAX_SELL_PRICE = 0.65  # Above this, market has already moved against us
+
+    # COIN-FLIP ZONE: 48-52c prices need higher confidence
+    # Backtest: 50c zone = 62.6% WR but 52% of all losing trades
+    # 1,194 low-conf losers in this zone = 41% of total loss dollars
+    COINFLIP_ZONE_LOW = 0.48
+    COINFLIP_ZONE_HIGH = 0.52
+    COINFLIP_MIN_CONFIDENCE = 0.70  # Need 70%+ confidence to trade 50c zone
 
     # Position sizing from Guy 1's data
     DEFAULT_POSITION_USD = 1500    # $1,500 per position (median ~$1,200)
@@ -149,7 +156,7 @@ class LatencyArbStrategy:
     def __init__(
         self,
         min_edge: float = 0.03,
-        confidence_threshold: float = 0.55,
+        confidence_threshold: float = 0.60,
         position_usd: float = 1500,
     ):
         self.min_edge = min_edge
@@ -321,6 +328,16 @@ class LatencyArbStrategy:
         if target_price > self.MAX_SELL_PRICE:
             return Signal(Side.NONE, raw_confidence, edge, 0, 0,
                           f"Price ${target_price:.2f} too high to sell (max ${self.MAX_SELL_PRICE})")
+
+        # COIN-FLIP ZONE GATE: 48-52c prices are near-random without high conviction.
+        # Backtest: 52% of losing trades and 41% of total loss $ came from
+        # low-confidence trades in this zone. Require 70%+ confidence.
+        if (self.COINFLIP_ZONE_LOW <= target_price <= self.COINFLIP_ZONE_HIGH
+                and raw_confidence < self.COINFLIP_MIN_CONFIDENCE):
+            return Signal(Side.NONE, raw_confidence, edge, 0, 0,
+                          f"Coin-flip zone (${target_price:.2f}) needs "
+                          f"conf >= {self.COINFLIP_MIN_CONFIDENCE:.0%} "
+                          f"(have {raw_confidence:.1%})")
 
         # 5-MIN PENALTY: Cross-trader data shows 5-min is net -$8.4K loser
         # Require higher edge and confidence to trade 5-min intervals
