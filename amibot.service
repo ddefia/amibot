@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket BTC Trading Bot
+Description=Polymarket Multi-Strategy Trading Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -7,11 +7,12 @@ Wants=network-online.target
 Type=simple
 User=user
 WorkingDirectory=/home/user/amibot
-ExecStart=/usr/bin/python3 /home/user/amibot/run.py
+ExecStart=/home/user/amibot/venv/bin/python3 /home/user/amibot/run.py
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/user/amibot/bot_output.log
 StandardError=append:/home/user/amibot/bot_output.log
+Environment=PYTHONUNBUFFERED=1
 
 # Restart even after 50 internal restarts exhausted
 StartLimitIntervalSec=600
