@@ -169,16 +169,51 @@ class RiskManager:
 
         return True, "OK"
 
+    @staticmethod
+    def kelly_fraction(edge_prob: float, price: float) -> float:
+        """Kelly Criterion: optimal bet fraction for long-term growth.
+
+        f* = (p * odds - (1-p)) / odds
+        where p = probability of winning, odds = (1/price) - 1
+
+        Uses fractional Kelly (0.25x) for safety — full Kelly is too
+        aggressive for binary markets where losses are always -100%.
+        """
+        if price <= 0 or price >= 1:
+            return 0.0
+        odds = (1.0 / price) - 1.0
+        if odds <= 0:
+            return 0.0
+        f_star = (edge_prob * odds - (1 - edge_prob)) / odds
+        # Fractional Kelly (25%) — avoids ruin from estimation errors
+        return max(0.0, f_star * 0.25)
+
     def adjust_size(self, signal: Signal) -> float:
-        """Adjust position size based on risk state AND bankroll.
+        """Adjust position size based on risk state, Kelly, AND bankroll.
 
         Applies:
-        1. Loss streak decay (0.8^n)
-        2. Remaining exposure room
-        3. Bankroll percentage cap (max 5% per trade)
+        1. Kelly Criterion sizing (fractional 0.25x)
+        2. Loss streak decay (0.8^n)
+        3. Remaining exposure room
+        4. Bankroll percentage cap (max 5% per trade)
         Returns adjusted size in USD.
         """
         size = signal.size
+
+        # Kelly Criterion: optimal sizing based on edge and price
+        # Only apply if we have a real bankroll to size against
+        if self.current_balance > 0 and signal.confidence > 0 and signal.price > 0:
+            kelly_f = self.kelly_fraction(signal.confidence, signal.price)
+            if kelly_f > 0:
+                kelly_size = self.current_balance * kelly_f
+                # Use the SMALLER of strategy size and Kelly size
+                # Kelly caps us; strategy provides the floor for minimum viable trades
+                if kelly_size < size:
+                    logger.debug(
+                        "Kelly sizing: f*=%.3f → $%.0f (vs strategy $%.0f)",
+                        kelly_f, kelly_size, size,
+                    )
+                    size = kelly_size
 
         # Reduce size after consecutive losses
         if self.consecutive_losses > 0:

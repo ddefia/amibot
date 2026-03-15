@@ -13,6 +13,7 @@ Uses the Gamma API to discover markets and categorize them by type.
 
 import asyncio
 import json
+import math
 import time
 import logging
 from dataclasses import dataclass, field
@@ -95,6 +96,7 @@ class MarketScanner:
         results = await asyncio.gather(
             self._scan_crypto_markets(),
             self._scan_all_active_for_arb(),
+            self._scan_multi_outcome_arb(),
             return_exceptions=True,
         )
 
@@ -284,6 +286,165 @@ class MarketScanner:
                 return opp
 
         return None
+
+    async def _scan_multi_outcome_arb(self) -> list[MarketOpportunity]:
+        """Scan events with 3+ outcomes for multi-outcome arbitrage.
+
+        In a multi-outcome event (e.g., "Who wins the election?" with 10 candidates),
+        the sum of all outcome prices should equal $1.00.
+        If the sum < $1.00, buying all outcomes is risk-free profit.
+        If the sum > $1.00, selling all outcomes is risk-free profit.
+
+        This catches arbs that binary scanners miss — the "Bregman projection"
+        approach from quant playbooks, simplified to practical scanning.
+        """
+        arbs = []
+
+        try:
+            # Fetch events (events group related markets)
+            resp = await self.client.get(
+                f"{self.gamma_host}/events",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 50,
+                },
+            )
+            resp.raise_for_status()
+            events = resp.json()
+
+            for event in events:
+                markets = event.get("markets", [])
+                if len(markets) < 3:
+                    continue  # Only interested in multi-outcome events
+
+                # Collect YES prices across all outcomes in this event
+                outcome_prices = []
+                valid_markets = []
+                for market in markets:
+                    prices_raw = market.get("outcomePrices", "[]")
+                    if isinstance(prices_raw, str):
+                        try:
+                            prices = json.loads(prices_raw)
+                        except json.JSONDecodeError:
+                            continue
+                    else:
+                        prices = prices_raw
+
+                    if not prices:
+                        continue
+
+                    try:
+                        yes_price = float(prices[0])  # First outcome = YES
+                    except (ValueError, TypeError, IndexError):
+                        continue
+
+                    if 0 < yes_price < 1:
+                        outcome_prices.append(yes_price)
+                        valid_markets.append(market)
+
+                if len(outcome_prices) < 3:
+                    continue
+
+                total = sum(outcome_prices)
+
+                # Multi-outcome arb: total should be ~1.0
+                # If total < 0.97, buy all outcomes → guaranteed profit
+                if total < 0.97:
+                    edge = 1.0 - total
+                    # Find the cheapest outcome to buy (highest expected return)
+                    min_idx = outcome_prices.index(min(outcome_prices))
+                    best_market = valid_markets[min_idx]
+
+                    opp = self._parse_to_opportunity(
+                        best_market,
+                        category="arb",
+                        interval_duration=0,
+                        asset="",
+                        data_source="polymarket_multi",
+                    )
+                    if opp:
+                        opp.combined_price = total
+                        opp.arb_edge = edge
+                        opp.extra = {
+                            "type": "multi_outcome",
+                            "num_outcomes": len(outcome_prices),
+                            "prices": outcome_prices,
+                            "event": event.get("title", "")[:80],
+                        }
+                        arbs.append(opp)
+                        logger.info(
+                            "Multi-outcome arb: %s | %d outcomes sum=$%.3f edge=%.1f%%",
+                            event.get("title", "")[:50],
+                            len(outcome_prices), total, edge * 100,
+                        )
+
+                # Also check for correlated market mispricings via KL-divergence
+                # If two outcomes in the same event have prices that don't make
+                # logical sense together, there's an information edge
+                self._check_correlation_edge(event, valid_markets, outcome_prices, arbs)
+
+        except Exception as e:
+            logger.warning("Multi-outcome arb scan error: %s", e)
+
+        return arbs
+
+    def _check_correlation_edge(
+        self,
+        event: dict,
+        markets: list[dict],
+        prices: list[float],
+        results: list[MarketOpportunity],
+    ):
+        """Check for KL-divergence mispricings between correlated outcomes.
+
+        If two mutually exclusive outcomes (e.g., Candidate A vs Candidate B)
+        have prices that imply different total probabilities when normalized,
+        one is mispriced relative to the other.
+
+        KL(P||Q) = Σ P_i * log(P_i / Q_i)
+        High KL = big divergence = potential edge.
+        """
+        if len(prices) < 3:
+            return
+
+        total = sum(prices)
+        if total <= 0:
+            return
+
+        # Normalize to proper probability distribution
+        normalized = [p / total for p in prices]
+
+        # Compare each outcome's market price vs. its "fair" normalized price
+        for i, (market, raw_price, norm_price) in enumerate(
+            zip(markets, prices, normalized)
+        ):
+            if norm_price <= 0 or raw_price <= 0:
+                continue
+
+            # KL contribution for this outcome
+            kl_contribution = norm_price * math.log(norm_price / raw_price) if raw_price > 0 else 0
+
+            # If this outcome is significantly underpriced vs. normalized fair value
+            price_gap = norm_price - raw_price
+            if price_gap > 0.05 and kl_contribution > 0.01:
+                opp = self._parse_to_opportunity(
+                    market,
+                    category="arb",
+                    interval_duration=0,
+                    asset="",
+                    data_source="kl_divergence",
+                )
+                if opp:
+                    opp.arb_edge = price_gap
+                    opp.extra = {
+                        "type": "kl_divergence",
+                        "kl_contribution": round(kl_contribution, 4),
+                        "fair_price": round(norm_price, 4),
+                        "market_price": round(raw_price, 4),
+                        "event": event.get("title", "")[:80],
+                    }
+                    results.append(opp)
 
     def _parse_to_opportunity(
         self,
